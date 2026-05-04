@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
@@ -119,8 +119,8 @@ class DecodingPress(BasePress):
         3. Applies compression every N steps
         4. Clears the buffer after compression
         """
-        hidden_states = kwargs["hidden_states"]
-        cache = kwargs["past_key_values"]
+        hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else input[0]
+        cache = kwargs.get("past_key_values", kwargs.get("layer_past"))
         q_len = hidden_states.shape[1]
         layer_idx = module.layer_idx
 

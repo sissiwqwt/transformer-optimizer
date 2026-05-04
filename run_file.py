@@ -1,6 +1,10 @@
-from transformers import pipeline
-from kvpress import KnormPress  # 训练免费方法之一
-from kvpress import ThinKPress
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from transformers import DynamicCache, pipeline
+
+from kvpress import DecodingPress, KnormPress
+
 
 def main():
     model = "EleutherAI/pythia-70m"
@@ -12,15 +16,29 @@ def main():
     )
 
     context = (
-        "The history of natural language processing (NLP) generally started in the 1950s, although work can be found from earlier periods. In 1950, Alan Turing published an article titled 'Computing Machinery and Intelligence' which proposed what is now called the Turing test as a criterion of intelligence. The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three or five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced. Little further research in machine translation was conducted until the late 1980s when the first statistical machine translation systems were developed.\n"
+        "Natural language processing began as a field in the 1950s, with early work on machine "
+        "translation and symbolic approaches. Statistical methods became prominent in the late "
+        "1980s and 1990s, and neural network methods later reshaped the field. Transformer models "
+        "now support many language tasks, but long-context generation can use a large KV cache."
     )
-    question = "Please summarize the main points and provide 3 conclusions."
+    question = "Summarize the context in two concise sentences."
 
-    # compression_ratio 越小，压缩越强（通常速度/显存更省，但可能影响质量）
-    press = ThinKPress(compression_ratio=0.5)
+    press = DecodingPress(
+        base_press=KnormPress(),
+        compression_interval=4,
+        target_size=32,
+        hidden_states_buffer_size=0,
+    )
 
-    out = pipe(context, question=question, press=press)
-    print(out["answer"])
+    output = pipe(
+        context,
+        question=question,
+        press=press,
+        cache=DynamicCache(),
+        max_new_tokens=40,
+    )
+    print(output["answer"])
+
 
 if __name__ == "__main__":
     main()

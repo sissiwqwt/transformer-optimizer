@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 
@@ -44,10 +44,10 @@ class SnapKVPress(ScorerPress):
         Compute the last window_size queries and associated attention weights for the first q_len - window_size keys.
         """
 
-        bsz, _, k_len, _ = keys.shape
+        bsz, num_key_value_heads, k_len, _ = keys.shape
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
-        num_key_value_groups = num_heads // module.config.num_key_value_heads
+        num_key_value_groups = num_heads // num_key_value_heads
 
         # Get last window_size queries
         query_states = get_prerope_query_states(module, hidden_states[:, -window_size:])
@@ -55,7 +55,10 @@ class SnapKVPress(ScorerPress):
         # Apply RoPE
         cos, sin = position_embeddings
         cos, sin = cos[:, -window_size:], sin[:, -window_size:]
-        query_states = (query_states * cos.unsqueeze(1)) + (rotate_half(query_states) * sin.unsqueeze(1))
+        rotary_dim = cos.shape[-1]
+        query_rot, query_pass = query_states[..., :rotary_dim], query_states[..., rotary_dim:]
+        query_rot = (query_rot * cos.unsqueeze(1)) + (rotate_half(query_rot) * sin.unsqueeze(1))
+        query_states = torch.cat((query_rot, query_pass), dim=-1)
 
         # Compute attention for first q_len - window_size tokens
         key_states = repeat_kv(keys, num_key_value_groups)

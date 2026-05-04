@@ -1,10 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
 from torch import nn
 from transformers import Cache, QuantizedCache
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXAttention
 from transformers.models.phi3.modeling_phi3 import Phi3Attention
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
@@ -38,6 +39,9 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     if isinstance(module, Phi3Attention):
         qkv = module.qkv_proj(hidden_states)
         query_states = qkv[..., : num_heads * head_dim]
+    elif isinstance(module, GPTNeoXAttention):
+        qkv = module.query_key_value(hidden_states)
+        query_states = qkv.view(bsz, q_len, num_heads, 3 * head_dim)[..., :head_dim]
     elif hasattr(module, "q_proj"):
         # Assume Llama-like attention layer
         query_states = module.q_proj(hidden_states)
