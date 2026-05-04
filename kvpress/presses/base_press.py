@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from transformers import (
     Gemma3ForConditionalGeneration,
+    GPTNeoXForCausalLM,
     LlamaForCausalLM,
     MistralForCausalLM,
     Phi3ForCausalLM,
@@ -31,7 +32,35 @@ SUPPORTED_MODELS = (
     Qwen2ForCausalLM,
     Qwen3ForCausalLM,
     Gemma3ForConditionalGeneration,
+    GPTNeoXForCausalLM,
 )
+
+
+def get_model_backbone(model: PreTrainedModel) -> nn.Module:
+    if hasattr(model, "model"):
+        return model.model
+
+    base_model_prefix = getattr(model, "base_model_prefix", None)
+    if base_model_prefix and hasattr(model, base_model_prefix):
+        return getattr(model, base_model_prefix)
+
+    if hasattr(model, "layers"):
+        return model
+
+    raise AttributeError(f"Could not find transformer backbone on model {type(model)}")
+
+
+def get_language_model(model: PreTrainedModel) -> nn.Module:
+    backbone = get_model_backbone(model)
+    return backbone.language_model if hasattr(backbone, "language_model") else backbone
+
+
+def get_attention_module(layer: nn.Module) -> nn.Module:
+    if hasattr(layer, "self_attn"):
+        return layer.self_attn
+    if hasattr(layer, "attention"):
+        return layer.attention
+    raise AttributeError(f"Could not find attention module on layer {type(layer)}")
 
 
 @dataclass
@@ -130,8 +159,8 @@ class BasePress:
             is the same as the input output, but the underlying cache has been compressed in-place.
         """
 
-        hidden_states = kwargs["hidden_states"]
-        cache = kwargs["past_key_values"]
+        hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else input[0]
+        cache = kwargs.get("past_key_values", kwargs.get("layer_past"))
         cache_layer = cache.layers[module.layer_idx]
         q_len = hidden_states.shape[1]
 
@@ -188,13 +217,17 @@ class BasePress:
         self.post_init_from_model(model)
         hooks = []
         try:
-            language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
+            language_model = get_language_model(model)
             for layer in language_model.layers:
-                if isinstance(model, Gemma3ForConditionalGeneration) and layer.self_attn.is_sliding:
+                attention_module = get_attention_module(layer)
+                if isinstance(model, Gemma3ForConditionalGeneration) and attention_module.is_sliding:
                     # Skip layers with sliding window attention, only for Gemma3
                     continue
-                layer.self_attn.rotary_emb = language_model.rotary_emb
-                hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                if not hasattr(attention_module, "head_dim") and hasattr(attention_module, "head_size"):
+                    attention_module.head_dim = attention_module.head_size
+                if hasattr(language_model, "rotary_emb"):
+                    attention_module.rotary_emb = language_model.rotary_emb
+                hooks.append(attention_module.register_forward_hook(self.forward_hook, with_kwargs=True))
             yield
         finally:
             for forward_hook in hooks:

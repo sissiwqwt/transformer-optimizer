@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, Cache, DynamicCache, Pipeline, Qu
 from transformers.pipelines import PIPELINE_REGISTRY
 from transformers.pipelines.base import GenericTensor
 
-from kvpress.presses.base_press import BasePress
+from kvpress.presses.base_press import BasePress, get_model_backbone
 from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.dms_press import DMSPress
 from kvpress.presses.finch_press import FinchPress
@@ -214,7 +214,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         perform_prefill_compression = press is not None and not isinstance(press, DecodingPress)
         with press(self.model) if perform_prefill_compression else contextlib.nullcontext():
             # We run the model without the lm head for pre-filling.
-            self.model.model(
+            get_model_backbone(self.model)(
                 input_ids=context_ids,
                 past_key_values=cache,
             )
