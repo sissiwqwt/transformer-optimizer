@@ -1,0 +1,297 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+import csv
+import gc
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, pipeline
+
+from kvpress import AdaKVPress, KnormPress, SnapKVPress, StreamingLLMPress
+
+
+MODEL_NAME = "EleutherAI/pythia-70m"
+QUESTION = "\nSummarize the passage in one sentence."
+
+
+@dataclass
+class Result:
+    dataset: str
+    press: str
+    model: str
+    compression_ratio: float
+    ppl: float
+    throughput_tokens_s: float
+    avg_latency_s: float
+    samples: int
+    context_tokens: int
+    target_tokens: int
+    max_new_tokens: int
+
+
+def iter_texts(dataset_name: str, split: str, local_pg19_txt: str | None = None) -> Iterable[str]:
+    if dataset_name == "wikitext":
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+        for row in dataset:
+            text = row["text"].strip()
+            if text:
+                yield text
+        return
+
+    if dataset_name == "pg19":
+        if local_pg19_txt:
+            text = Path(local_pg19_txt).read_text(encoding="utf-8").strip()
+            if text:
+                yield text
+            return
+
+        for hub_name in ("emozilla/pg19", "pg19"):
+            try:
+                dataset = load_dataset(hub_name, split=split, streaming=True)
+                for row in dataset:
+                    text = row.get("text", "").strip()
+                    if text:
+                        yield text
+                return
+            except Exception as exc:
+                print(f"[WARN] Could not load {hub_name}: {exc}")
+        return
+
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def collect_token_windows(
+    tokenizer,
+    dataset_name: str,
+    split: str,
+    num_samples: int,
+    context_tokens: int,
+    target_tokens: int,
+    local_pg19_txt: str | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+    windows = []
+    required_tokens = context_tokens + target_tokens
+    buffer: list[int] = []
+
+    for text in iter_texts(dataset_name, split, local_pg19_txt):
+        buffer.extend(tokenizer.encode(text, add_special_tokens=False))
+        if len(buffer) < required_tokens:
+            continue
+
+        token_ids = buffer[:required_tokens]
+        context_ids = torch.tensor([token_ids[:context_tokens]], dtype=torch.long)
+        target_ids = torch.tensor([token_ids[context_tokens:]], dtype=torch.long)
+        context_text = tokenizer.decode(token_ids[:context_tokens], skip_special_tokens=True)
+        windows.append((context_ids, target_ids, context_text))
+        buffer = buffer[required_tokens:]
+
+        if len(windows) >= num_samples:
+            break
+
+    if not windows:
+        raise RuntimeError(
+            f"No usable {dataset_name} samples with at least {required_tokens} tokens. "
+            "Lower --context-tokens/--target-tokens or provide --local-pg19-txt."
+        )
+    return windows
+
+
+def build_press(name: str, compression_ratio: float, snapkv_window_size: int):
+    if name == "adakv":
+        return AdaKVPress(SnapKVPress(compression_ratio=compression_ratio, window_size=snapkv_window_size))
+    if name == "knorm":
+        return KnormPress(compression_ratio=compression_ratio)
+    if name == "snapkv":
+        return SnapKVPress(compression_ratio=compression_ratio, window_size=snapkv_window_size)
+    if name == "streamingllm":
+        return StreamingLLMPress(compression_ratio=compression_ratio)
+    raise ValueError(f"Unknown press: {name}")
+
+
+def synchronize():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def clear_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def evaluate_ppl(model, token_windows, press) -> float:
+    model.eval()
+    nll_sum = 0.0
+    token_count = 0
+
+    for context_ids, target_ids, _ in token_windows:
+        context_ids = context_ids.to(model.device)
+        target_ids = target_ids.to(model.device)
+        cache = DynamicCache()
+
+        with press(model):
+            context_outputs = model(input_ids=context_ids, past_key_values=cache)
+
+        first_token_logits = context_outputs.logits[:, -1, :]
+        first_token_loss = F.cross_entropy(first_token_logits, target_ids[:, 0], reduction="sum")
+        nll_sum += first_token_loss.item()
+        token_count += 1
+
+        if target_ids.shape[1] > 1:
+            continuation_ids = target_ids[:, :-1]
+            continuation_labels = target_ids[:, 1:]
+            outputs = model(input_ids=continuation_ids, past_key_values=cache)
+            logits = outputs.logits
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                continuation_labels.reshape(-1),
+                reduction="sum",
+            )
+            nll_sum += loss.item()
+            token_count += continuation_labels.numel()
+
+    return math.exp(nll_sum / token_count)
+
+
+@torch.no_grad()
+def evaluate_throughput(gen_pipe, contexts: list[str], press, max_new_tokens: int, warmup: int) -> tuple[float, float]:
+    for context in contexts[:warmup]:
+        gen_pipe(context, question=QUESTION, press=press, max_new_tokens=max_new_tokens)
+
+    latencies = []
+    for context in contexts:
+        synchronize()
+        start = time.perf_counter()
+        gen_pipe(context, question=QUESTION, press=press, max_new_tokens=max_new_tokens)
+        synchronize()
+        latencies.append(time.perf_counter() - start)
+
+    total_latency = sum(latencies)
+    avg_latency = total_latency / len(latencies)
+    throughput = (len(contexts) * max_new_tokens) / total_latency
+    return avg_latency, throughput
+
+
+def run(args) -> list[Result]:
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast_tokenizer)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        dtype=dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+    if not torch.cuda.is_available():
+        model = model.to("cpu")
+
+    gen_pipe = pipeline(
+        "kv-press-text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+
+    results = []
+    for dataset_name in args.datasets:
+        print(f"\nDataset: {dataset_name}")
+        token_windows = collect_token_windows(
+            tokenizer=tokenizer,
+            dataset_name=dataset_name,
+            split=args.split,
+            num_samples=args.num_samples,
+            context_tokens=args.context_tokens,
+            target_tokens=args.target_tokens,
+            local_pg19_txt=args.local_pg19_txt,
+        )
+        contexts = [context for _, _, context in token_windows]
+
+        for press_name in args.presses:
+            clear_memory()
+            press = build_press(press_name, args.compression_ratio, args.snapkv_window_size)
+            ppl = evaluate_ppl(model, token_windows, press)
+
+            clear_memory()
+            press = build_press(press_name, args.compression_ratio, args.snapkv_window_size)
+            avg_latency, throughput = evaluate_throughput(
+                gen_pipe=gen_pipe,
+                contexts=contexts,
+                press=press,
+                max_new_tokens=args.max_new_tokens,
+                warmup=args.warmup,
+            )
+
+            print(
+                f"{press_name:>12}: ppl={ppl:.4f}, "
+                f"throughput={throughput:.2f} tokens/s, avg_latency={avg_latency:.4f}s"
+            )
+            results.append(
+                Result(
+                    dataset=dataset_name,
+                    press=press_name,
+                    model=args.model,
+                    compression_ratio=args.compression_ratio,
+                    ppl=ppl,
+                    throughput_tokens_s=throughput,
+                    avg_latency_s=avg_latency,
+                    samples=len(token_windows),
+                    context_tokens=args.context_tokens,
+                    target_tokens=args.target_tokens,
+                    max_new_tokens=args.max_new_tokens,
+                )
+            )
+
+    return results
+
+
+def write_csv(results: list[Result], output_csv: str):
+    fieldnames = list(Result.__dataclass_fields__)
+    with open(output_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(result.__dict__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate AdaKV, Knorm, SnapKV, and StreamingLLM on Pythia with Wikitext and PG19."
+    )
+    parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument("--use-fast-tokenizer", action="store_true")
+    parser.add_argument("--datasets", nargs="+", default=["wikitext", "pg19"], choices=["wikitext", "pg19"])
+    parser.add_argument(
+        "--presses",
+        nargs="+",
+        default=["adakv", "knorm", "snapkv", "streamingllm"],
+        choices=["adakv", "knorm", "snapkv", "streamingllm"],
+    )
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--num-samples", type=int, default=3)
+    parser.add_argument("--context-tokens", type=int, default=1024)
+    parser.add_argument("--target-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--compression-ratio", type=float, default=0.5)
+    parser.add_argument("--snapkv-window-size", type=int, default=64)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--local-pg19-txt", default=None)
+    parser.add_argument("--output-csv", default="pythia_kvpress_test_results.csv")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    results = run(args)
+    write_csv(results, args.output_csv)
+    print(f"\nWrote results to {args.output_csv}")
+
+
+if __name__ == "__main__":
+    main()

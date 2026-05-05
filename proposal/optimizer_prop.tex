@@ -1,0 +1,94 @@
+\documentclass[UTF8]{ctexart}
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+
+\title{KVPress 优化想法评估}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{总体结论}
+
+五条想法中，最值得优先推进的是想法 2 和想法 4：它们都可以作为轻量级
+\texttt{ScorerPress} 包装器实现，改动小，便于和现有 press 横向比较。想法 5
+创新性较高，但会触及注意力计算和 cache 结构，工程风险最大。想法 1 和想法
+3 与仓库已有组合、多阶段、跨层/跨头分配机制重合较多，需要明确新贡献点。
+
+\section*{逐项评估}
+
+\begin{tabular}{p{0.08\linewidth}p{0.24\linewidth}p{0.22\linewidth}p{0.16\linewidth}p{0.18\linewidth}}
+\toprule
+编号 & 方法描述 & 与已有方法重合度 & 可行性 & 创新程度 & 建议 \\
+\midrule
+1 &
+先轻量级（如knorm）再用运算复杂的press（kvzap）&
+较高。仓库已有 \texttt{ComposedPress} 可顺序组合多个 press；
+\texttt{CriticalKVPress} 也是两阶段选择；\texttt{KVzapPress} 和
+\texttt{FastKVzipPress} 已覆盖 KVzip 近似方向。 &
+中等。轻量 press 后再运行复杂 press 容易实现，但第二阶段若依赖原始 attention、
+hidden states 或完整上下文，可能因第一阶段已裁剪而失真。 &
+中等偏低，除非提出自适应预算、误差反馈或专门针对 Pythia 的训练策略。 &
+可作为 baseline 组合实验；不要单独作为主要创新点。 \\
+\midrule
+2 &
+利用分数不确定性进行重打分 &
+中等。\texttt{AdaKVPress} 已利用跨头分数做全局选择，
+\texttt{KVComposePress} 有跨头聚合，但没有显式建模分数不确定性。 &
+高。可封装任意 \texttt{ScorerPress}，在 \texttt{score} 后计算局部方差或头间分歧。 &
+中等偏高。若证明不确定性可稳定保护争议 token，有明确增量。 &
+优先实现；建议先用 head-wise disagreement，成本低于局部窗口方差。 \\
+\midrule
+3 &
+跨层共同删除 &
+较高。\texttt{KVzipPress} 会跨层汇总分数并做全局 pruning；
+\texttt{KVComposePress} 也计算层级 composite score；
+\texttt{PerLayerCompressionPress} 处理逐层压缩比例。 &
+中等偏低。普通 forward hook 是逐层触发，跨层共同决策需要先收集所有层 KV/score，
+再统一修改 cache 或使用 masking。 &
+低到中等。简单求和/平均较像已有全局预算分配。 &
+仅当加入层可靠性校准、层间一致性约束或动态预算时才值得推进。 \\
+\midrule
+4 &
+利用锚点和局部冗余进行删除 &
+中等。\texttt{KeyDiffPress} 已用 key 相似度保留离群 key；
+\texttt{ChunkKVPress}/\texttt{ChunkPress} 关注局部结构，但没有实体、数字、特殊符号锚点。 &
+高。token 级锚点可从 \texttt{input\_ids} 或 tokenizer 文本恢复；局部 cosine
+可在 \texttt{score} 中计算。 &
+中等偏高。语义锚点加局部冗余惩罚是较清晰的混合启发式。 &
+推荐实现为 \texttt{AnchorRedundancyPress}，先限制为 query-free、prefill-only。 \\
+\midrule
+5 &
+跨层共同删除 + 低秩残差恢复 &
+中等。\texttt{CAMPress} 已把待删 token 的 value 合并到邻近保留 token；
+\texttt{KVzipPress} 用上下文重构估计重要性；但仓库暂无``删除后可恢复''
+的低秩残差 cache。 &
+低。需要改变 attention 路径，让被删 token 的近似 \(\hat K,\hat V\) 和残差参与后续计算；
+否则不能真正减少计算，或会破坏 transformers 标准 cache 接口。 &
+高。若能用低秩残差显著保留信息，同时保持较小 cache 和标准接口兼容，会有研究价值。 &
+作为长期研究方向；先做离线 oracle/ablation，不建议第一步直接集成到主 API。 \\
+\bottomrule
+\end{tabular}
+
+\section*{推荐实验顺序}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 实现不确定性重打分包装器：
+  \(s'_i=s_i(1+\lambda u_i)\)，比较局部方差与头间分歧两种
+  \(u_i\)。它与现有 \texttt{ScorerPress} 兼容，最容易进入
+  \texttt{tests/default\_presses.py} 和 \texttt{evaluation/evaluate\_registry.py}。
+  \item 实现锚点加局部冗余 press：锚点包括数字、实体近似 token、标点/特殊符号；
+  冗余项用局部窗口内 key cosine similarity 的负值或离群度。该方法应与
+  \texttt{KeyDiffPress}、\texttt{KnormPress}、\texttt{ExpectedAttentionPress}
+  对比。
+  \item 把两阶段 prefill 作为组合 baseline，而非新方法主体。重点验证
+  \texttt{StreamingLLMPress}/\texttt{KnormPress} 预裁剪是否会损害
+  \texttt{ExpectedAttentionPress}/\texttt{KVzapPress} 的后续打分。
+  \item 跨层共同删除和低秩残差恢复放在第二阶段研究；前者需要跨层状态管理，
+  后者需要修改 attention/cache 语义，工程成本明显更高。
+\end{enumerate}
+
+\end{document}
