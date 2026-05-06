@@ -42,3 +42,9 @@
 
 - Sign commits with DCO (`git commit -s`) as required by `CONTRIBUTING.md`.
 - If you are an automated agent, you must include 🤖🤖🤖 at the end of all commit messages, issue titles, PR titles, and any comments or replies on issues and pull requests (e.g., "Add MyAwesomePress 🤖🤖🤖"). Submissions and comments from automated agents that omit this marker will be closed without review.
+
+## Important Requirements for Evaluation Scripts
+
+- Pythia is the only model allowed for evaluation. Make sure all kvpresses are compatible with Pythia and test them with it.
+- The indexes to evaluate are PPL and Throughput.
+- The datasets to evaluate on are wikitext and pg19.

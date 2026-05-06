@@ -1,0 +1,13 @@
+dataset,press,metric,compression_ratio,samples,context_tokens,value
+wikitext,none,ppl,0.0,3,1024,30.726340216053227
+wikitext,none,throughput_tokens_s,0.0,3,1024,75.93702732167925
+wikitext,knorm,ppl,0.5,3,1024,105.92549175935814
+wikitext,knorm,throughput_tokens_s,0.5,3,1024,80.07129347793058
+wikitext,uncertainty_head_var,ppl,0.5,3,1024,97.74426681077793
+wikitext,uncertainty_head_var,throughput_tokens_s,0.5,3,1024,82.71386250730944
+pg19,none,ppl,0.0,1,1024,26.950601936198513
+pg19,none,throughput_tokens_s,0.0,1,1024,75.77219562962935
+pg19,knorm,ppl,0.5,1,1024,71.12304814240312
+pg19,knorm,throughput_tokens_s,0.5,1,1024,80.25450710567092
+pg19,uncertainty_head_var,ppl,0.5,1,1024,82.87189094167785
+pg19,uncertainty_head_var,throughput_tokens_s,0.5,1,1024,81.24864955857349
