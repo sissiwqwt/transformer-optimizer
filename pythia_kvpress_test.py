@@ -4,6 +4,7 @@
 import argparse
 import csv
 import gc
+import inspect
 import math
 import time
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from typing import Iterable
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 from kvpress import AdaKVPress, KnormPress, SnapKVPress, StreamingLLMPress
 
@@ -35,6 +36,19 @@ class Result:
     context_tokens: int
     target_tokens: int
     max_new_tokens: int
+
+
+class NoPress:
+    """Baseline press: no KV compression."""
+
+    def __call__(self, model):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 def iter_texts(dataset_name: str, split: str, local_pg19_txt: str | None = None) -> Iterable[str]:
@@ -82,15 +96,21 @@ def collect_token_windows(
     buffer: list[int] = []
 
     for text in iter_texts(dataset_name, split, local_pg19_txt):
-        buffer.extend(tokenizer.encode(text, add_special_tokens=False))
+        # Add a newline to avoid unnaturally joining separate documents/paragraphs.
+        buffer.extend(tokenizer.encode(text + "\n", add_special_tokens=False))
+
         if len(buffer) < required_tokens:
             continue
 
         token_ids = buffer[:required_tokens]
+
         context_ids = torch.tensor([token_ids[:context_tokens]], dtype=torch.long)
         target_ids = torch.tensor([token_ids[context_tokens:]], dtype=torch.long)
         context_text = tokenizer.decode(token_ids[:context_tokens], skip_special_tokens=True)
+
         windows.append((context_ids, target_ids, context_text))
+
+        # Non-overlapping windows.
         buffer = buffer[required_tokens:]
 
         if len(windows) >= num_samples:
@@ -101,18 +121,34 @@ def collect_token_windows(
             f"No usable {dataset_name} samples with at least {required_tokens} tokens. "
             "Lower --context-tokens/--target-tokens or provide --local-pg19-txt."
         )
+
     return windows
 
 
 def build_press(name: str, compression_ratio: float, snapkv_window_size: int):
+    if name == "none":
+        return NoPress()
+
     if name == "adakv":
-        return AdaKVPress(SnapKVPress(compression_ratio=compression_ratio, window_size=snapkv_window_size))
+        return AdaKVPress(
+            SnapKVPress(
+                compression_ratio=compression_ratio,
+                window_size=snapkv_window_size,
+            )
+        )
+
     if name == "knorm":
         return KnormPress(compression_ratio=compression_ratio)
+
     if name == "snapkv":
-        return SnapKVPress(compression_ratio=compression_ratio, window_size=snapkv_window_size)
+        return SnapKVPress(
+            compression_ratio=compression_ratio,
+            window_size=snapkv_window_size,
+        )
+
     if name == "streamingllm":
         return StreamingLLMPress(compression_ratio=compression_ratio)
+
     raise ValueError(f"Unknown press: {name}")
 
 
@@ -127,35 +163,117 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 
+def _build_position_kwargs(model, start_pos: int, seq_len: int, device) -> dict:
+    """
+    Important for compressed KV cache.
+
+    After KV compression, cache length is shorter than the original context length.
+    If position_ids/cache_position are not set manually, the model may infer positions
+    from compressed cache length instead of original absolute context length.
+
+    Example:
+      original context length = 1024
+      compressed cache length = 512
+      continuation should start at position 1024, not 512.
+    """
+    forward_params = inspect.signature(model.forward).parameters
+
+    position_ids = torch.arange(
+        start_pos,
+        start_pos + seq_len,
+        device=device,
+        dtype=torch.long,
+    ).unsqueeze(0)
+
+    kwargs = {"position_ids": position_ids}
+
+    # Newer Transformers models may use cache_position.
+    if "cache_position" in forward_params:
+        kwargs["cache_position"] = position_ids.squeeze(0)
+
+    return kwargs
+
+
 @torch.no_grad()
 def evaluate_ppl(model, token_windows, press) -> float:
+    """
+    Computes causal LM perplexity on target tokens conditioned on context tokens.
+
+    Scoring layout:
+      context: x_0 ... x_{C-1}
+      target:  y_0 ... y_{T-1}
+
+    Loss terms:
+      p(y_0 | context)
+      p(y_1 | context, y_0)
+      ...
+      p(y_{T-1} | context, y_0 ... y_{T-2})
+    """
     model.eval()
+
     nll_sum = 0.0
     token_count = 0
 
     for context_ids, target_ids, _ in token_windows:
         context_ids = context_ids.to(model.device)
         target_ids = target_ids.to(model.device)
-        cache = DynamicCache()
 
+        # Prefill context. If press is not NoPress, KV cache will be compressed here.
         with press(model):
-            context_outputs = model(input_ids=context_ids, past_key_values=cache)
+            context_outputs = model(
+                input_ids=context_ids,
+                use_cache=True,
+            )
 
+        cache = context_outputs.past_key_values
+
+        if cache is None:
+            raise RuntimeError(
+                "Model did not return past_key_values. "
+                "Make sure the model supports use_cache=True."
+            )
+
+        # First target token is predicted by the last context logits.
         first_token_logits = context_outputs.logits[:, -1, :]
-        first_token_loss = F.cross_entropy(first_token_logits, target_ids[:, 0], reduction="sum")
+        first_token_loss = F.cross_entropy(
+            first_token_logits,
+            target_ids[:, 0],
+            reduction="sum",
+        )
+
         nll_sum += first_token_loss.item()
         token_count += 1
 
+        # Remaining target tokens are predicted using previous target tokens.
         if target_ids.shape[1] > 1:
             continuation_ids = target_ids[:, :-1]
             continuation_labels = target_ids[:, 1:]
-            outputs = model(input_ids=continuation_ids, past_key_values=cache)
+
+            seq_len = continuation_ids.shape[1]
+            start_pos = context_ids.shape[1]
+
+            position_kwargs = _build_position_kwargs(
+                model=model,
+                start_pos=start_pos,
+                seq_len=seq_len,
+                device=model.device,
+            )
+
+            outputs = model(
+                input_ids=continuation_ids,
+                past_key_values=cache,
+                use_cache=True,
+                **position_kwargs,
+            )
+
             logits = outputs.logits
+
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 continuation_labels.reshape(-1),
                 reduction="sum",
             )
+
             nll_sum += loss.item()
             token_count += continuation_labels.numel()
 
@@ -163,32 +281,58 @@ def evaluate_ppl(model, token_windows, press) -> float:
 
 
 @torch.no_grad()
-def evaluate_throughput(gen_pipe, contexts: list[str], press, max_new_tokens: int, warmup: int) -> tuple[float, float]:
+def evaluate_throughput(
+    gen_pipe,
+    contexts: list[str],
+    press,
+    max_new_tokens: int,
+    warmup: int,
+) -> tuple[float, float]:
     for context in contexts[:warmup]:
-        gen_pipe(context, question=QUESTION, press=press, max_new_tokens=max_new_tokens)
+        gen_pipe(
+            context,
+            question=QUESTION,
+            press=press,
+            max_new_tokens=max_new_tokens,
+        )
 
     latencies = []
+
     for context in contexts:
         synchronize()
         start = time.perf_counter()
-        gen_pipe(context, question=QUESTION, press=press, max_new_tokens=max_new_tokens)
+
+        gen_pipe(
+            context,
+            question=QUESTION,
+            press=press,
+            max_new_tokens=max_new_tokens,
+        )
+
         synchronize()
         latencies.append(time.perf_counter() - start)
 
     total_latency = sum(latencies)
     avg_latency = total_latency / len(latencies)
     throughput = (len(contexts) * max_new_tokens) / total_latency
+
     return avg_latency, throughput
 
 
 def run(args) -> list[Result]:
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast_tokenizer)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        use_fast=args.use_fast_tokenizer,
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        dtype=dtype,
+        torch_dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
+
     if not torch.cuda.is_available():
         model = model.to("cpu")
 
@@ -200,8 +344,10 @@ def run(args) -> list[Result]:
     )
 
     results = []
+
     for dataset_name in args.datasets:
         print(f"\nDataset: {dataset_name}")
+
         token_windows = collect_token_windows(
             tokenizer=tokenizer,
             dataset_name=dataset_name,
@@ -211,15 +357,32 @@ def run(args) -> list[Result]:
             target_tokens=args.target_tokens,
             local_pg19_txt=args.local_pg19_txt,
         )
+
         contexts = [context for _, _, context in token_windows]
 
         for press_name in args.presses:
             clear_memory()
-            press = build_press(press_name, args.compression_ratio, args.snapkv_window_size)
-            ppl = evaluate_ppl(model, token_windows, press)
+
+            press = build_press(
+                name=press_name,
+                compression_ratio=args.compression_ratio,
+                snapkv_window_size=args.snapkv_window_size,
+            )
+
+            ppl = evaluate_ppl(
+                model=model,
+                token_windows=token_windows,
+                press=press,
+            )
 
             clear_memory()
-            press = build_press(press_name, args.compression_ratio, args.snapkv_window_size)
+
+            press = build_press(
+                name=press_name,
+                compression_ratio=args.compression_ratio,
+                snapkv_window_size=args.snapkv_window_size,
+            )
+
             avg_latency, throughput = evaluate_throughput(
                 gen_pipe=gen_pipe,
                 contexts=contexts,
@@ -230,8 +393,10 @@ def run(args) -> list[Result]:
 
             print(
                 f"{press_name:>12}: ppl={ppl:.4f}, "
-                f"throughput={throughput:.2f} tokens/s, avg_latency={avg_latency:.4f}s"
+                f"throughput={throughput:.2f} tokens/s, "
+                f"avg_latency={avg_latency:.4f}s"
             )
+
             results.append(
                 Result(
                     dataset=dataset_name,
@@ -253,26 +418,37 @@ def run(args) -> list[Result]:
 
 def write_csv(results: list[Result], output_csv: str):
     fieldnames = list(Result.__dataclass_fields__)
+
     with open(output_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
+
         for result in results:
             writer.writerow(result.__dict__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate AdaKV, Knorm, SnapKV, and StreamingLLM on Pythia with Wikitext and PG19."
+        description="Evaluate KVPress methods on causal LM perplexity and throughput."
     )
+
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--use-fast-tokenizer", action="store_true")
-    parser.add_argument("--datasets", nargs="+", default=["wikitext", "pg19"], choices=["wikitext", "pg19"])
+
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["wikitext", "pg19"],
+        choices=["wikitext", "pg19"],
+    )
+
     parser.add_argument(
         "--presses",
         nargs="+",
-        default=["adakv", "knorm", "snapkv", "streamingllm"],
-        choices=["adakv", "knorm", "snapkv", "streamingllm"],
+        default=["none", "adakv", "knorm", "snapkv", "streamingllm"],
+        choices=["none", "adakv", "knorm", "snapkv", "streamingllm"],
     )
+
     parser.add_argument("--split", default="test")
     parser.add_argument("--num-samples", type=int, default=3)
     parser.add_argument("--context-tokens", type=int, default=1024)
@@ -283,13 +459,20 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--local-pg19-txt", default=None)
     parser.add_argument("--output-csv", default="pythia_kvpress_test_results.csv")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
     results = run(args)
-    write_csv(results, args.output_csv)
+
+    write_csv(
+        results=results,
+        output_csv=args.output_csv,
+    )
+
     print(f"\nWrote results to {args.output_csv}")
 
 
