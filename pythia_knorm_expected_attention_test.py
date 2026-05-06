@@ -19,7 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from kvpress import ComposedPress, ExpectedAttentionPress, KnormPress
 
 
-MODEL_NAME = "EleutherAI/pythia-70m"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 QUESTION = "\nSummarize the passage in one sentence."
 
 
@@ -340,7 +340,7 @@ def write_csv(results: list[Result], output_csv: str):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate Knorm -> ExpectedAttention sequential compression on Pythia."
+        description="Evaluate Knorm -> ExpectedAttention sequential compression on Qwen."
     )
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--use-fast-tokenizer", action="store_true")
@@ -364,7 +364,7 @@ def parse_args():
     parser.add_argument("--expected-attention-no-vnorm", action="store_true")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--local-pg19-txt", default=None)
-    parser.add_argument("--output-csv", default="pythia_knorm_expected_attention_results.csv")
+    parser.add_argument("--output-csv", default="qwen_knorm_expected_attention_results.csv")
     return parser.parse_args()
 
 
