@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# How to run:
+#   python uncertainty_aware_pythia.py
+#   You can paste part of the pg19 data in ~/data/<dataname>.txt and specify --local-pg19-txt ~/data/<dataname>.txt to avoid streaming issues.
 
 import argparse
 import csv
