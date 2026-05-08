@@ -24,11 +24,11 @@ QUESTION = "\nSummarize the passage in one sentence."
 class EvaluationResult:
     dataset: str
     press: str
-    metric: str
     compression_ratio: float
     samples: int
     context_tokens: int
-    value: float
+    ppl: float
+    throughput_tokens_s: float
 
 
 def iter_nonempty_texts(dataset_name: str, split: str, local_pg19_txt: str | None) -> Iterable[str]:
@@ -208,27 +208,16 @@ def run_evaluation(args) -> list[EvaluationResult]:
             throughput = evaluate_throughput(gen_pipe, contexts, press, args.max_new_tokens, args.warmup)
             print(f"{press_name}: ppl={ppl:.4f}, throughput={throughput:.2f} tokens/s")
 
-            results.extend(
-                [
-                    EvaluationResult(
-                        dataset=dataset_name,
-                        press=press_name,
-                        metric="ppl",
-                        compression_ratio=compression_ratio,
-                        samples=len(contexts),
-                        context_tokens=args.context_tokens,
-                        value=ppl,
-                    ),
-                    EvaluationResult(
-                        dataset=dataset_name,
-                        press=press_name,
-                        metric="throughput_tokens_s",
-                        compression_ratio=compression_ratio,
-                        samples=len(contexts),
-                        context_tokens=args.context_tokens,
-                        value=throughput,
-                    ),
-                ]
+            results.append(
+                EvaluationResult(
+                    dataset=dataset_name,
+                    press=press_name,
+                    compression_ratio=compression_ratio,
+                    samples=len(contexts),
+                    context_tokens=args.context_tokens,
+                    ppl=ppl,
+                    throughput_tokens_s=throughput,
+                )
             )
 
     return results
