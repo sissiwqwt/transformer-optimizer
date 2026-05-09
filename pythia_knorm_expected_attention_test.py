@@ -23,6 +23,34 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 QUESTION = "\nSummarize the passage in one sentence."
 
 
+def find_repo_root() -> Path:
+    for path in [Path(__file__).resolve().parent, *Path(__file__).resolve().parents]:
+        if (path / "pyproject.toml").exists():
+            return path
+    return Path(__file__).resolve().parent
+
+
+REPO_ROOT = find_repo_root()
+RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "pythia_knorm_expected_attention"
+DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "qwen_knorm_expected_attention_results.csv"
+
+
+def resolve_repo_path(path: str | Path) -> Path:
+    resolved_path = Path(path).expanduser()
+    if resolved_path.is_absolute():
+        return resolved_path
+    return REPO_ROOT / resolved_path
+
+
+def resolve_output_csv_path(path: str | Path) -> Path:
+    output_path = Path(path).expanduser()
+    if output_path.is_absolute():
+        return output_path
+    if output_path.parent == Path("."):
+        return RESULTS_OUTPUT_DIR / output_path
+    return REPO_ROOT / output_path
+
+
 @dataclass
 class Result:
     dataset: str
@@ -64,7 +92,7 @@ def iter_texts(dataset_name: str, split: str, local_pg19_txt: str | None = None)
 
     if dataset_name == "pg19":
         if local_pg19_txt:
-            text = Path(local_pg19_txt).read_text(encoding="utf-8").strip()
+            text = resolve_repo_path(local_pg19_txt).read_text(encoding="utf-8").strip()
             if text:
                 yield text
             return
@@ -330,18 +358,21 @@ def run(args) -> list[Result]:
     return results
 
 
-def write_csv(results: list[Result], output_csv: str):
-    with open(output_csv, "w", newline="", encoding="utf-8") as handle:
+def write_csv(results: list[Result], output_csv: str | Path) -> Path:
+    output_path = resolve_output_csv_path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(Result.__dataclass_fields__))
         writer.writeheader()
         for result in results:
             writer.writerow(result.__dict__)
 
+    return output_path
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate Knorm -> ExpectedAttention sequential compression on Qwen."
-    )
+    parser = argparse.ArgumentParser(description="Evaluate Knorm -> ExpectedAttention sequential compression on Qwen.")
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--use-fast-tokenizer", action="store_true")
     parser.add_argument("--datasets", nargs="+", default=["wikitext", "pg19"], choices=["wikitext", "pg19"])
@@ -364,15 +395,22 @@ def parse_args():
     parser.add_argument("--expected-attention-no-vnorm", action="store_true")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--local-pg19-txt", default=None)
-    parser.add_argument("--output-csv", default="qwen_knorm_expected_attention_results.csv")
+    parser.add_argument(
+        "--output-csv",
+        default=str(DEFAULT_OUTPUT_CSV),
+        help=(
+            "CSV output path. Passing only a filename, e.g. results.csv, saves to "
+            f"{RESULTS_OUTPUT_DIR / '<filename>.csv'}."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     results = run(args)
-    write_csv(results, args.output_csv)
-    print(f"\nWrote results to {args.output_csv}")
+    output_path = write_csv(results, args.output_csv)
+    print(f"\nWrote results to {output_path}")
 
 
 if __name__ == "__main__":

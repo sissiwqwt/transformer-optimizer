@@ -23,6 +23,34 @@ MODEL_NAME = "EleutherAI/pythia-70m"
 QUESTION = "\nSummarize the passage in one sentence."
 
 
+def find_repo_root() -> Path:
+    for path in [Path(__file__).resolve().parent, *Path(__file__).resolve().parents]:
+        if (path / "pyproject.toml").exists():
+            return path
+    return Path(__file__).resolve().parent
+
+
+REPO_ROOT = find_repo_root()
+RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "pythia_kvpress_test"
+DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "pythia_kvpress_test_results.csv"
+
+
+def resolve_repo_path(path: str | Path) -> Path:
+    resolved_path = Path(path).expanduser()
+    if resolved_path.is_absolute():
+        return resolved_path
+    return REPO_ROOT / resolved_path
+
+
+def resolve_output_csv_path(path: str | Path) -> Path:
+    output_path = Path(path).expanduser()
+    if output_path.is_absolute():
+        return output_path
+    if output_path.parent == Path("."):
+        return RESULTS_OUTPUT_DIR / output_path
+    return REPO_ROOT / output_path
+
+
 @dataclass
 class Result:
     dataset: str
@@ -62,7 +90,7 @@ def iter_texts(dataset_name: str, split: str, local_pg19_txt: str | None = None)
 
     if dataset_name == "pg19":
         if local_pg19_txt:
-            text = Path(local_pg19_txt).read_text(encoding="utf-8").strip()
+            text = resolve_repo_path(local_pg19_txt).read_text(encoding="utf-8").strip()
             if text:
                 yield text
             return
@@ -236,10 +264,7 @@ def evaluate_ppl(model, tokenizer, token_windows, press, dataset_name: str, pres
         cache = context_outputs.past_key_values
 
         if cache is None:
-            raise RuntimeError(
-                "Model did not return past_key_values. "
-                "Make sure the model supports use_cache=True."
-            )
+            raise RuntimeError("Model did not return past_key_values. " "Make sure the model supports use_cache=True.")
 
         # First target token is predicted by the last context logits.
         first_token_logits = context_outputs.logits[:, -1, :]
@@ -451,21 +476,23 @@ def run(args) -> list[Result]:
     return results
 
 
-def write_csv(results: list[Result], output_csv: str):
+def write_csv(results: list[Result], output_csv: str | Path) -> Path:
     fieldnames = list(Result.__dataclass_fields__)
+    output_path = resolve_output_csv_path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as handle:
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
 
         for result in results:
             writer.writerow(result.__dict__)
 
+    return output_path
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate KVPress methods on causal LM perplexity and throughput."
-    )
+    parser = argparse.ArgumentParser(description="Evaluate KVPress methods on causal LM perplexity and throughput.")
 
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--use-fast-tokenizer", action="store_true")
@@ -493,7 +520,14 @@ def parse_args():
     parser.add_argument("--snapkv-window-size", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--local-pg19-txt", default=None)
-    parser.add_argument("--output-csv", default="pythia_kvpress_test_results.csv")
+    parser.add_argument(
+        "--output-csv",
+        default=str(DEFAULT_OUTPUT_CSV),
+        help=(
+            "CSV output path. Passing only a filename, e.g. results.csv, saves to "
+            f"{RESULTS_OUTPUT_DIR / '<filename>.csv'}."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -503,12 +537,12 @@ def main():
 
     results = run(args)
 
-    write_csv(
+    output_path = write_csv(
         results=results,
         output_csv=args.output_csv,
     )
 
-    print(f"\nWrote results to {args.output_csv}")
+    print(f"\nWrote results to {output_path}")
 
 
 if __name__ == "__main__":
