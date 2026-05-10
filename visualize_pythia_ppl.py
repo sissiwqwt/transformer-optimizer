@@ -9,34 +9,74 @@ import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-RESULTS_DIR = REPO_ROOT / "results" / "pythia_kvpress_test"
+DEFAULT_RESULTS_NAME = "uncertainty_aware"
+RESULTS_DIRS = {
+    "uncertainty_aware": REPO_ROOT / "results" / "uncertainty_aware",
+    "pythia_kvpress_test": REPO_ROOT / "results" / "pythia_kvpress_test",
+}
 REQUIRED_COLUMNS = {"dataset", "press", "ppl"}
 
 
-def latest_csv(results_dir: Path) -> Path:
-    csv_files = sorted(results_dir.glob("*.csv"), key=lambda path: path.stat().st_mtime, reverse=True)
+def list_csv_files(results_dir: Path) -> list[Path]:
+    csv_files = sorted(results_dir.glob("*.csv"))
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found in {results_dir}")
-    return csv_files[0]
+    return csv_files
 
 
-def resolve_csv_path(csv_path: str | None) -> Path:
-    if csv_path is None:
-        return latest_csv(RESULTS_DIR)
+def resolve_results_dirs(results_dir: str) -> list[Path]:
+    if results_dir == "both":
+        return list(RESULTS_DIRS.values())
 
-    path = Path(csv_path).expanduser()
+    if results_dir in RESULTS_DIRS:
+        return [RESULTS_DIRS[results_dir]]
+
+    path = Path(results_dir).expanduser()
     if path.is_absolute():
-        return path
+        return [path]
 
     direct_path = REPO_ROOT / path
     if direct_path.exists():
-        return direct_path
+        return [direct_path]
 
-    return RESULTS_DIR / path
+    return [REPO_ROOT / "results" / results_dir]
+
+
+def resolve_csv_paths(csv_path: str | None, results_dirs: list[Path]) -> list[Path]:
+    if csv_path is None:
+        csv_paths = []
+        for results_dir in results_dirs:
+            csv_paths.extend(list_csv_files(results_dir))
+        return csv_paths
+
+    path = Path(csv_path).expanduser()
+    if path.is_absolute():
+        return [path]
+
+    direct_path = REPO_ROOT / path
+    if direct_path.exists():
+        return [direct_path]
+
+    csv_paths = [results_dir / path for results_dir in results_dirs if (results_dir / path).exists()]
+    if csv_paths:
+        return csv_paths
+
+    return [results_dirs[0] / path]
 
 
 def default_output_path(csv_path: Path) -> Path:
     return csv_path.with_name(f"{csv_path.stem}_ppl_comparison.png")
+
+
+def resolve_output_path(output: str | None, csv_paths: list[Path], csv_path: Path) -> Path:
+    if output is None:
+        return default_output_path(csv_path)
+
+    output_path = Path(output).expanduser()
+    if len(csv_paths) == 1:
+        return output_path
+
+    return output_path / default_output_path(csv_path).name
 
 
 def load_results(csv_path: Path) -> pd.DataFrame:
@@ -106,14 +146,23 @@ def plot_ppl(df: pd.DataFrame, csv_path: Path, output_path: Path, use_log_scale:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize PPL comparison between presses from one pythia_kvpress_test CSV."
+        description="Visualize Pythia PPL comparison between presses from result CSV files."
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=DEFAULT_RESULTS_NAME,
+        help=(
+            "Results directory to read. Accepts uncertainty_aware, pythia_kvpress_test, both, "
+            "an absolute path, a repo-relative path, or a directory name under results/. "
+            "Defaults to uncertainty_aware."
+        ),
     )
     parser.add_argument(
         "--csv",
         default=None,
         help=(
             "CSV file to plot. Accepts an absolute path, a repo-relative path, or a filename in "
-            "results/pythia_kvpress_test. Defaults to the newest CSV in that directory."
+            "the selected results directory. Defaults to all CSV files in the selected directory."
         ),
     )
     parser.add_argument(
@@ -131,13 +180,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    csv_path = resolve_csv_path(args.csv)
-    output_path = Path(args.output).expanduser() if args.output else default_output_path(csv_path)
+    results_dirs = resolve_results_dirs(args.results_dir)
+    csv_paths = resolve_csv_paths(args.csv, results_dirs)
 
-    df = load_results(csv_path)
-    plot_ppl(df=df, csv_path=csv_path, output_path=output_path, use_log_scale=not args.linear)
+    for csv_path in csv_paths:
+        output_path = resolve_output_path(args.output, csv_paths, csv_path)
+        df = load_results(csv_path)
+        plot_ppl(df=df, csv_path=csv_path, output_path=output_path, use_log_scale=not args.linear)
 
-    print(f"Wrote PPL comparison plot to {output_path}")
+        print(f"Wrote PPL comparison plot to {output_path}")
 
 
 if __name__ == "__main__":

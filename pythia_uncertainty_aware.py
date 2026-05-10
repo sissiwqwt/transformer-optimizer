@@ -19,10 +19,31 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-from kvpress import KnormPress, UncertaintyAwarePress
+from kvpress import (
+    CompactorPress,
+    CURPress,
+    ExpectedAttentionPress,
+    KeyDiffPress,
+    KnormPress,
+    LagKVPress,
+    NonCausalAttnPress,
+    SnapKVPress,
+    UncertaintyAwarePress,
+)
 
 DEFAULT_MODEL = "EleutherAI/pythia-70m"
 QUESTION = "\nSummarize the passage in one sentence."
+BASE_PRESS_CHOICES = (
+    "knorm",
+    "keydiff",
+    "cur",
+    "lagkv",
+    "snapkv",
+    "expected_attention",
+    "non_causal_attn",
+    "compactor",
+)
+PRESS_CHOICES = ("none", *BASE_PRESS_CHOICES, "uncertainty_head_var")
 
 
 def find_repo_root() -> Path:
@@ -159,15 +180,35 @@ def _build_position_kwargs(model, absolute_start_pos: int, cache_start_pos: int,
     return kwargs
 
 
-def build_press(name: str, compression_ratio: float, uncertainty_weight: float):
-    if name == "none":
-        return None
+def build_base_press(name: str, compression_ratio: float = 0.0):
     if name == "knorm":
         return KnormPress(compression_ratio=compression_ratio)
+    if name == "keydiff":
+        return KeyDiffPress(compression_ratio=compression_ratio)
+    if name == "cur":
+        return CURPress(compression_ratio=compression_ratio)
+    if name == "lagkv":
+        return LagKVPress(compression_ratio=compression_ratio)
+    if name == "snapkv":
+        return SnapKVPress(compression_ratio=compression_ratio)
+    if name == "expected_attention":
+        return ExpectedAttentionPress(compression_ratio=compression_ratio)
+    if name == "non_causal_attn":
+        return NonCausalAttnPress(compression_ratio=compression_ratio)
+    if name == "compactor":
+        return CompactorPress(compression_ratio=compression_ratio)
+    raise ValueError(f"Unknown base press: {name}")
+
+
+def build_press(name: str, compression_ratio: float, uncertainty_weight: float, uncertainty_base_press: str):
+    if name == "none":
+        return None
+    if name in BASE_PRESS_CHOICES:
+        return build_base_press(name, compression_ratio=compression_ratio)
     if name == "uncertainty_head_var":
         return UncertaintyAwarePress(
             compression_ratio=compression_ratio,
-            press=KnormPress(),
+            press=build_base_press(uncertainty_base_press),
             uncertainty_weight=uncertainty_weight,
         )
     raise ValueError(f"Unknown press: {name}")
@@ -303,7 +344,12 @@ def run_evaluation(args) -> list[EvaluationResult]:
         for press_name in args.presses:
             clear_memory()
             compression_ratio = 0.0 if press_name == "none" else args.compression_ratio
-            press = build_press(press_name, args.compression_ratio, args.uncertainty_weight)
+            press = build_press(
+                press_name,
+                args.compression_ratio,
+                args.uncertainty_weight,
+                args.uncertainty_base_press,
+            )
 
             ppl = evaluate_ppl(model, token_windows, press)
             throughput = evaluate_throughput(gen_pipe, contexts, press, args.max_new_tokens, args.warmup)
@@ -348,7 +394,13 @@ def parse_args():
         "--presses",
         nargs="+",
         default=["none", "knorm", "uncertainty_head_var"],
-        choices=["none", "knorm", "uncertainty_head_var"],
+        choices=PRESS_CHOICES,
+    )
+    parser.add_argument(
+        "--uncertainty-base-press",
+        default="knorm",
+        choices=BASE_PRESS_CHOICES,
+        help="Base scorer used inside UncertaintyAwarePress when --presses includes uncertainty_head_var.",
     )
     parser.add_argument("--split", default="test")
     parser.add_argument("--num-samples", type=int, default=3)

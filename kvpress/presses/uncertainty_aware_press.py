@@ -27,6 +27,8 @@ class UncertaintyAwarePress(ScorerPress):
         Fraction of key-value pairs to remove during compression.
     press : ScorerPress, default=KnormPress()
         Base scorer used to compute per-head token importance scores.
+        Query/key/value geometry and attention-based scorers with dense
+        per-KV-head scores are the best fit for the head-variance adjustment.
     uncertainty_weight : float, default=1.0
         Risk-aversion coefficient applied to the normalized head-wise variance.
     normalize_scores : bool, default=True
@@ -46,8 +48,12 @@ class UncertaintyAwarePress(ScorerPress):
 
     def __post_init__(self):
         super().__post_init__()
+        assert isinstance(self.press, ScorerPress), "UncertaintyAwarePress requires a ScorerPress as input"
         assert self.uncertainty_weight >= 0, "uncertainty_weight must be non-negative"
         assert self.epsilon > 0, "epsilon must be positive"
+
+    def post_init_from_model(self, model):
+        self.press.post_init_from_model(model)
 
     def _minmax_normalize(self, scores: torch.Tensor) -> torch.Tensor:
         min_scores = scores.amin(dim=-1, keepdim=True)
