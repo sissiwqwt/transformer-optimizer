@@ -191,24 +191,31 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 
-def _build_position_kwargs(model, start_pos: int, seq_len: int, device) -> dict:
+def _cache_seq_length(cache) -> int:
+    if hasattr(cache, "get_seq_length"):
+        return int(cache.get_seq_length(0))
+    return int(cache[0][0].shape[-2])
+
+
+def _build_position_kwargs(model, absolute_start_pos: int, cache_start_pos: int, seq_len: int, device) -> dict:
     """
     Important for compressed KV cache.
 
     After KV compression, cache length is shorter than the original context length.
-    If position_ids/cache_position are not set manually, the model may infer positions
-    from compressed cache length instead of original absolute context length.
+    The rotary position_ids should stay on the original absolute timeline, while
+    cache_position should follow the physical cache indices used for masking/cache updates.
 
     Example:
       original context length = 1024
       compressed cache length = 512
-      continuation should start at position 1024, not 512.
+      position_ids should start at 1024
+      cache_position should start at 512
     """
     forward_params = inspect.signature(model.forward).parameters
 
     position_ids = torch.arange(
-        start_pos,
-        start_pos + seq_len,
+        absolute_start_pos,
+        absolute_start_pos + seq_len,
         device=device,
         dtype=torch.long,
     ).unsqueeze(0)
@@ -217,7 +224,12 @@ def _build_position_kwargs(model, start_pos: int, seq_len: int, device) -> dict:
 
     # Newer Transformers models may use cache_position.
     if "cache_position" in forward_params:
-        kwargs["cache_position"] = position_ids.squeeze(0)
+        kwargs["cache_position"] = torch.arange(
+            cache_start_pos,
+            cache_start_pos + seq_len,
+            device=device,
+            dtype=torch.long,
+        )
 
     return kwargs
 
@@ -284,11 +296,11 @@ def evaluate_ppl(model, tokenizer, token_windows, press, dataset_name: str, pres
             continuation_labels = target_ids[:, 1:]
 
             seq_len = continuation_ids.shape[1]
-            start_pos = context_ids.shape[1]
 
             position_kwargs = _build_position_kwargs(
                 model=model,
-                start_pos=start_pos,
+                absolute_start_pos=context_ids.shape[1],
+                cache_start_pos=_cache_seq_length(cache),
                 seq_len=seq_len,
                 device=model.device,
             )
@@ -312,16 +324,16 @@ def evaluate_ppl(model, tokenizer, token_windows, press, dataset_name: str, pres
             nll_sum += loss.item()
             token_count += continuation_labels.numel()
 
-        if not printed_check:
-            predicted_target_ids = torch.cat(predicted_tokens, dim=1)
-            target_text = tokenizer.decode(target_ids[0], skip_special_tokens=True)
-            predicted_text = tokenizer.decode(predicted_target_ids[0], skip_special_tokens=True)
+        # if not printed_check:
+        #     predicted_target_ids = torch.cat(predicted_tokens, dim=1)
+        #     target_text = tokenizer.decode(target_ids[0], skip_special_tokens=True)
+        #     predicted_text = tokenizer.decode(predicted_target_ids[0], skip_special_tokens=True)
 
-            print(f"\n[PPL check] dataset={dataset_name} press={press_name}")
-            print(f"Input context:\n{_preview_text(context_text)}")
-            print(f"Target context:\n{_preview_text(target_text)}")
-            print(f"Model predicted context:\n{_preview_text(predicted_text)}")
-            printed_check = True
+        #     print(f"\n[PPL check] dataset={dataset_name} press={press_name}")
+        #     print(f"Input context:\n{_preview_text(context_text)}")
+        #     print(f"Target context:\n{_preview_text(target_text)}")
+        #     print(f"Model predicted context:\n{_preview_text(predicted_text)}")
+        #     printed_check = True
 
     return math.exp(nll_sum / token_count)
 
@@ -361,11 +373,11 @@ def evaluate_throughput(
         synchronize()
         latencies.append(time.perf_counter() - start)
 
-        if not printed_check:
-            print(f"\n[Throughput check] dataset={dataset_name} press={press_name}")
-            print(f"Question:{QUESTION}")
-            print(f"Answer:\n{_preview_text(result['answer'])}")
-            printed_check = True
+        # if not printed_check:
+        #     print(f"\n[Throughput check] dataset={dataset_name} press={press_name}")
+        #     print(f"Question:{QUESTION}")
+        #     print(f"Answer:\n{_preview_text(result['answer'])}")
+        #     printed_check = True
 
     total_latency = sum(latencies)
     avg_latency = total_latency / len(latencies)

@@ -169,3 +169,7 @@ cython_debug/
 
 # data files
 data/*
+
+compare.md
+evaluate.py
+.pycache_check/*

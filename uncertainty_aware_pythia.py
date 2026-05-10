@@ -133,18 +133,29 @@ def collect_token_windows(
     return windows
 
 
-def _build_position_kwargs(model, start_pos: int, seq_len: int, device) -> dict:
+def _cache_seq_length(cache) -> int:
+    if hasattr(cache, "get_seq_length"):
+        return int(cache.get_seq_length(0))
+    return int(cache[0][0].shape[-2])
+
+
+def _build_position_kwargs(model, absolute_start_pos: int, cache_start_pos: int, seq_len: int, device) -> dict:
     forward_params = inspect.signature(model.forward).parameters
     position_ids = torch.arange(
-        start_pos,
-        start_pos + seq_len,
+        absolute_start_pos,
+        absolute_start_pos + seq_len,
         device=device,
         dtype=torch.long,
     ).unsqueeze(0)
 
     kwargs = {"position_ids": position_ids}
     if "cache_position" in forward_params:
-        kwargs["cache_position"] = position_ids.squeeze(0)
+        kwargs["cache_position"] = torch.arange(
+            cache_start_pos,
+            cache_start_pos + seq_len,
+            device=device,
+            dtype=torch.long,
+        )
     return kwargs
 
 
@@ -216,7 +227,8 @@ def evaluate_ppl(model, token_windows, press) -> float:
             continuation_labels = target_ids[:, 1:]
             position_kwargs = _build_position_kwargs(
                 model=model,
-                start_pos=context_ids.shape[1],
+                absolute_start_pos=context_ids.shape[1],
+                cache_start_pos=_cache_seq_length(cache),
                 seq_len=continuation_ids.shape[1],
                 device=model.device,
             )
