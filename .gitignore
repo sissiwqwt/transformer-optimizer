@@ -176,3 +176,4 @@ evaluate.py
 proposal/*
 report/*
 cache/*
+!report/*.tex
