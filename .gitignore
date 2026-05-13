@@ -173,3 +173,6 @@ data/*
 compare.md
 evaluate.py
 .pycache_check/*
+proposal/*
+report/*
+cache/*

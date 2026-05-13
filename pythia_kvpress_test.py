@@ -31,8 +31,27 @@ def find_repo_root() -> Path:
 
 
 REPO_ROOT = find_repo_root()
-RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "pythia_kvpress_test"
+# RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "pythia_kvpress_test"
+RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "cuda_base_test"
 DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "pythia_kvpress_test_results.csv"
+
+
+def resolve_device(device_arg: str) -> str:
+    if device_arg == "auto":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    device = torch.device(device_arg)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Requested --device {device_arg}, but CUDA is not available.")
+        if device.index is None:
+            return "cuda:0"
+        return f"cuda:{device.index}"
+
+    if device.type == "cpu":
+        return "cpu"
+
+    raise ValueError(f"Unsupported --device value: {device_arg}. Use auto, cpu, cuda, or cuda:0.")
 
 
 def resolve_repo_path(path: str | Path) -> Path:
@@ -387,28 +406,36 @@ def evaluate_throughput(
 
 
 def run(args) -> list[Result]:
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device = resolve_device(args.device)
+    use_auto_device = args.device == "auto"
+    use_cuda = device.startswith("cuda")
+    dtype = torch.float16 if use_cuda else torch.float32
+
+    print(f"Using device: {device} (requested: {args.device})")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         use_fast=args.use_fast_tokenizer,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    model_kwargs = {"torch_dtype": dtype}
+    if use_auto_device and use_cuda:
+        model_kwargs["device_map"] = "auto"
 
-    if not torch.cuda.is_available():
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+
+    if not use_auto_device:
+        model = model.to(device)
+    elif not use_cuda:
         model = model.to("cpu")
 
-    gen_pipe = pipeline(
-        "kv-press-text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    pipeline_kwargs = {}
+    if use_auto_device and use_cuda:
+        pipeline_kwargs["device_map"] = "auto"
+    elif not use_auto_device:
+        pipeline_kwargs["device"] = device
+
+    gen_pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tokenizer, **pipeline_kwargs)
 
     results = []
 
@@ -507,6 +534,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate KVPress methods on causal LM perplexity and throughput.")
 
     parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device to use: auto, cpu, cuda, or cuda:0. Default: auto.",
+    )
     parser.add_argument("--use-fast-tokenizer", action="store_true")
 
     parser.add_argument(

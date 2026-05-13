@@ -54,8 +54,27 @@ def find_repo_root() -> Path:
 
 
 REPO_ROOT = find_repo_root()
-RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "uncertainty_aware"
+# RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "uncertainty_aware"
+RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "cuda_uncertainty_aware"
 DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "pythia_results.csv"
+
+
+def resolve_device(device_arg: str) -> str:
+    if device_arg == "auto":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    device = torch.device(device_arg)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Requested --device {device_arg}, but CUDA is not available.")
+        if device.index is None:
+            return "cuda:0"
+        return f"cuda:{device.index}"
+
+    if device.type == "cpu":
+        return "cpu"
+
+    raise ValueError(f"Unsupported --device value: {device_arg}. Use auto, cpu, cuda, or cuda:0.")
 
 
 def resolve_repo_path(path: str | Path) -> Path:
@@ -310,22 +329,33 @@ def run_evaluation(args) -> list[EvaluationResult]:
     if not args.model.startswith("EleutherAI/pythia-"):
         raise ValueError("Pythia is the only model allowed for this evaluation script.")
 
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device = resolve_device(args.device)
+    use_auto_device = args.device == "auto"
+    use_cuda = device.startswith("cuda")
+    dtype = torch.float16 if use_cuda else torch.float32
+
+    print(f"Using device: {device} (requested: {args.device})")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast_tokenizer)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-    if not torch.cuda.is_available():
+
+    model_kwargs = {"dtype": dtype}
+    if use_auto_device and use_cuda:
+        model_kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+
+    if not use_auto_device:
+        model = model.to(device)
+    elif not use_cuda:
         model = model.to("cpu")
 
-    gen_pipe = pipeline(
-        "kv-press-text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    pipeline_kwargs = {}
+    if use_auto_device and use_cuda:
+        pipeline_kwargs["device_map"] = "auto"
+    elif not use_auto_device:
+        pipeline_kwargs["device"] = device
+
+    gen_pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tokenizer, **pipeline_kwargs)
 
     results = []
     for dataset_name in args.datasets:
@@ -388,6 +418,11 @@ def write_csv(results: list[EvaluationResult], output_csv: str | Path) -> Path:
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate head-wise variance uncertainty press on Pythia.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device to use: auto, cpu, cuda, or cuda:0. Default: auto.",
+    )
     parser.add_argument("--use-fast-tokenizer", action="store_true")
     parser.add_argument("--datasets", nargs="+", default=["wikitext", "pg19"], choices=["wikitext", "pg19"])
     parser.add_argument(
