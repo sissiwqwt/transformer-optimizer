@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -58,18 +59,25 @@ def load_results(csv_path: Path) -> pd.DataFrame:
     return df.sort_values(["dataset", "press", "compression_ratio"])
 
 
-def format_title(metric: str, dataset: str, df: pd.DataFrame) -> str:
+def format_title_parts(metric: str, dataset: str, df: pd.DataFrame) -> tuple[str, str]:
     details = []
     for column in ("model", "device", "context_tokens", "target_tokens", "samples"):
         if column in df.columns and df[column].nunique(dropna=True) == 1:
             details.append(f"{column}={df[column].dropna().iloc[0]}")
-    suffix = f" ({', '.join(details)})" if details else ""
-    return f"{metric} on {dataset}{suffix}"
+    return f"{metric} on {dataset}", ", ".join(details)
 
 
-def finish_plot(fig: plt.Figure, output_path: Path) -> None:
+def set_wrapped_title(fig: plt.Figure, ax, metric: str, dataset: str, df: pd.DataFrame) -> None:
+    title, details = format_title_parts(metric, dataset, df)
+    ax.set_title(title)
+    if details:
+        wrapped_details = "\n".join(textwrap.wrap(details, width=95))
+        fig.text(0.5, 0.025, wrapped_details, ha="center", va="bottom", fontsize=9)
+
+
+def finish_plot(fig: plt.Figure, output_path: Path, bottom: float = 0.13) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, bottom, 1, 1))
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
     print(f"Wrote {output_path}")
@@ -83,7 +91,7 @@ def plot_metric_curve(df: pd.DataFrame, dataset: str, metric: str, ylabel: str, 
         group = group.sort_values("compression_ratio")
         ax.plot(group["compression_ratio"], group[metric], marker="o", linewidth=2, label=press)
 
-    ax.set_title(format_title(ylabel, dataset, plot_df))
+    set_wrapped_title(fig, ax, ylabel, dataset, plot_df)
     ax.set_xlabel("Compression ratio")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.25)
@@ -106,7 +114,7 @@ def plot_tradeoff(df: pd.DataFrame, dataset: str, output_path: Path) -> None:
                 fontsize=8,
             )
 
-    ax.set_title(format_title("PPL vs Throughput", dataset, plot_df))
+    set_wrapped_title(fig, ax, "PPL vs Throughput", dataset, plot_df)
     ax.set_xlabel("PPL (lower is better)")
     ax.set_ylabel("Throughput tokens/s (higher is better)")
     ax.grid(True, alpha=0.25)
@@ -132,6 +140,7 @@ def plot_relative_to_none(df: pd.DataFrame, dataset: str, output_path: Path) -> 
     plot_df = plot_df[plot_df["press"] != "none"]
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharex=True)
+    set_wrapped_title(fig, axes[0], "Relative to No Compression", dataset, plot_df)
     for press, group in plot_df.groupby("press", sort=True):
         group = group.sort_values("compression_ratio")
         axes[0].plot(group["compression_ratio"], group["ppl_ratio_to_none"], marker="o", linewidth=2, label=press)

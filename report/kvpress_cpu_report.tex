@@ -1,0 +1,259 @@
+\documentclass{article}
+
+\usepackage{neurips_2025}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{amsmath}
+
+\title{CPU Evaluation of KV Cache Compression Methods on Pythia}
+
+\author{%
+  KVPress Reproduction Report\\
+  \texttt{EleutherAI/pythia-70m}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report evaluates four reproduced KV cache compression methods in the
+\texttt{kvpress} framework: \texttt{KnormPress}, \texttt{SnapKVPress},
+\texttt{AdaKVPress}, and \texttt{StreamingLLMPress}. The benchmark uses
+\texttt{EleutherAI/pythia-70m} on WikiText-2 and PG-19 with 1024-token contexts
+and 256-token perplexity targets. Throughput is measured only during the decode
+stage after prefilling and KV compression, so the reported speed isolates the
+effect of a smaller runtime KV cache rather than the one-time compression cost.
+On CPU, the strongest quality--speed tradeoff is obtained by \texttt{SnapKVPress}
+and \texttt{StreamingLLMPress}: they preserve perplexity well at moderate
+compression and improve decode throughput over the uncompressed baseline.
+\end{abstract}
+
+\section{Implementation}
+
+The evaluation is implemented in \texttt{pythia\_kvpress\_test.py}. The script
+loads \texttt{EleutherAI/pythia-70m} with Hugging Face Transformers and evaluates
+the same model across all presses. When \texttt{--device cpu} is used, the model
+runs in \texttt{float32} and results are written to
+\texttt{results/cpu\_base\_test}. The reproduced run analyzed here is:
+\begin{center}
+\small
+\texttt{python pythia\_kvpress\_test.py --output-csv ctxt1024\_tar\_256\_try\_cpu.csv --device cpu}
+\end{center}
+
+\paragraph{Compared methods.}
+The dense baseline is implemented as \texttt{NoPress}, which leaves the KV cache
+unchanged. The four compression methods are constructed through
+\texttt{build\_press}. \texttt{KnormPress} is a score-based method that ranks KV
+entries by the negative key-vector norm in the current implementation.
+\texttt{SnapKVPress} scores old tokens by the average attention received from a
+recent observation window, with a default window size of 64 tokens, and protects
+the observation window from pruning. \texttt{AdaKVPress} wraps
+\texttt{SnapKVPress} and applies adaptive head-wise compression: it uses the base
+scores but prunes across heads with a safeguard so that each KV head keeps a
+minimum fraction of its budget. \texttt{StreamingLLMPress} implements the
+attention-sink and recent-window strategy: it keeps the first sink tokens and
+the most recent tokens, while pruning tokens in the middle.
+
+\paragraph{Perplexity evaluation.}
+For each dataset, the script builds non-overlapping token windows. Each window
+contains 1024 context tokens and 256 target tokens. The context is first passed
+through the model inside the press hook, so the returned \texttt{past\_key\_values}
+are already compressed for every method except \texttt{NoPress}. The first
+target token is scored from the final context logit, and the remaining target
+tokens are scored using teacher forcing with the compressed cache. The code
+keeps absolute \texttt{position\_ids} on the original context timeline, while
+\texttt{cache\_position} follows the physical compressed-cache length when the
+model exposes that argument. This distinction is important because KV
+compression shortens the stored cache but should not change the semantic token
+positions used by RoPE.
+
+\paragraph{Throughput evaluation.}
+The script measures decode throughput after the prefill and compression stages.
+For \texttt{NoPress}, timing starts after the uncompressed prefill. For compressed
+methods, timing starts after the context has been prefilling-compressed and
+after a fixed question prompt has been added to the cache. The timed loop then
+generates 64 greedy tokens, and throughput is computed as generated tokens
+divided by the timed decode latency. This measurement answers a specific
+question: how much faster is token-by-token decoding once the cache has already
+been reduced? It intentionally excludes the one-time scoring and compression
+cost.
+
+\section{Experimental Setup}
+
+Table~\ref{tab:setup} summarizes the configuration used by the reproduced CPU
+run. WikiText-2 provided three valid samples. The PG-19 run used the local
+\texttt{data/pg19\_sample.txt} fallback and produced one valid sample, so its
+numbers should be interpreted as a smoke-style long-context check rather than a
+full benchmark estimate.
+
+\begin{table}[t]
+\centering
+\caption{Benchmark configuration for \texttt{ctxt1024\_tar\_256\_try\_cpu.csv}.}
+\label{tab:setup}
+\begin{tabular}{l l}
+\toprule
+Parameter & Value \\
+\midrule
+Model & \texttt{EleutherAI/pythia-70m} \\
+Device / dtype & CPU / \texttt{float32} \\
+Datasets & WikiText-2, PG-19 \\
+Context tokens & 1024 \\
+Target tokens for PPL & 256 \\
+Generated tokens for throughput & 64 \\
+Compression ratios & 0.2, 0.4, 0.5, 0.6, 0.8 \\
+Warmup windows & 3 \\
+Throughput repetitions & 3 \\
+SnapKV window size & 64 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results}
+
+\subsection{WikiText-2}
+
+Table~\ref{tab:wikitext} reports perplexity and decode throughput on WikiText-2.
+The dense baseline has PPL 32.30 and throughput 65.89 tokens/s. At low
+compression ratio 0.2, \texttt{SnapKVPress} and \texttt{StreamingLLMPress}
+nearly preserve baseline perplexity while improving throughput by about
+40\% and 37\%, respectively. As compression becomes stronger, throughput
+continues to improve for most methods, but perplexity degrades because fewer
+context KV pairs remain available during target scoring.
+
+\begin{table}[t]
+\centering
+\caption{WikiText-2 CPU results. PPL is lower better; throughput is higher better.}
+\label{tab:wikitext}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrrrrrr}
+\toprule
+Method & \multicolumn{2}{c}{0.2} & \multicolumn{2}{c}{0.4} & \multicolumn{2}{c}{0.5} & \multicolumn{2}{c}{0.6} & \multicolumn{2}{c}{0.8} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+ & PPL & tok/s & PPL & tok/s & PPL & tok/s & PPL & tok/s & PPL & tok/s \\
+\midrule
+none & 32.30 & 65.89 & 32.30 & 65.89 & 32.30 & 65.89 & 32.30 & 65.89 & 32.30 & 65.89 \\
+adakv & 44.55 & 72.27 & 49.80 & 80.31 & 50.95 & 76.64 & 53.17 & 66.54 & 59.90 & 77.75 \\
+knorm & 35.43 & 72.18 & 42.94 & 91.44 & 46.69 & 92.96 & 48.06 & 94.05 & 56.43 & 99.22 \\
+snapkv & 33.65 & 92.67 & 35.89 & 84.65 & 37.50 & 81.69 & 39.90 & 95.28 & 43.68 & 102.23 \\
+streamingllm & 32.71 & 90.56 & 41.40 & 96.81 & 41.86 & 82.15 & 43.10 & 99.29 & 44.77 & 102.97 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{PG-19}
+
+Table~\ref{tab:pg19} reports the same sweep on PG-19. The dense baseline has
+PPL 23.51 and throughput 89.69 tokens/s. \texttt{StreamingLLMPress} is the most
+robust method at low compression in this run: at ratio 0.2 it slightly improves
+PPL to 23.32 and increases throughput to 94.09 tokens/s. \texttt{SnapKVPress}
+also preserves quality well across the sweep, staying below PPL 25 even at
+ratio 0.8. \texttt{KnormPress} gives competitive throughput at moderate
+compression but loses more perplexity at high compression. \texttt{AdaKVPress}
+is consistently slower or lower-quality than \texttt{SnapKVPress} here, despite
+using SnapKV scores as its base.
+
+\begin{table}[t]
+\centering
+\caption{PG-19 CPU results. PPL is lower better; throughput is higher better.}
+\label{tab:pg19}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrrrrrr}
+\toprule
+Method & \multicolumn{2}{c}{0.2} & \multicolumn{2}{c}{0.4} & \multicolumn{2}{c}{0.5} & \multicolumn{2}{c}{0.6} & \multicolumn{2}{c}{0.8} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+ & PPL & tok/s & PPL & tok/s & PPL & tok/s & PPL & tok/s & PPL & tok/s \\
+\midrule
+none & 23.51 & 89.69 & 23.51 & 89.69 & 23.51 & 89.69 & 23.51 & 89.69 & 23.51 & 89.69 \\
+adakv & 25.08 & 80.36 & 26.75 & 78.31 & 27.03 & 79.80 & 27.18 & 72.26 & 27.77 & 72.65 \\
+knorm & 25.21 & 92.89 & 27.06 & 97.02 & 27.37 & 96.88 & 28.27 & 100.91 & 31.92 & 88.31 \\
+snapkv & 23.52 & 91.41 & 23.87 & 98.44 & 23.94 & 100.01 & 23.95 & 97.55 & 24.93 & 98.65 \\
+streamingllm & 23.32 & 94.09 & 23.57 & 94.96 & 23.99 & 94.22 & 23.91 & 99.72 & 24.34 & 103.22 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.48\linewidth]{../results/cpu_base_test/figures/ctxt1024_tar_256_try_cpu_wikitext_tradeoff.png}
+\includegraphics[width=0.48\linewidth]{../results/cpu_base_test/figures/ctxt1024_tar_256_try_cpu_pg19_tradeoff.png}
+\caption{Perplexity--throughput tradeoff on WikiText-2 and PG-19. Points closer to the lower-right are better.}
+\label{fig:tradeoff}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.48\linewidth]{../results/cpu_base_test/figures/ctxt1024_tar_256_try_cpu_wikitext_relative_to_none.png}
+\includegraphics[width=0.48\linewidth]{../results/cpu_base_test/figures/ctxt1024_tar_256_try_cpu_pg19_relative_to_none.png}
+\caption{Relative PPL and throughput compared with the no-compression baseline at each compression ratio.}
+\label{fig:relative}
+\end{figure}
+
+\section{Analysis}
+
+\paragraph{Why throughput improves.}
+During autoregressive decoding, each new token attends to all cached keys and
+values. After prefill-time compression, the cache length is reduced from the
+original 1024 context tokens to roughly \(1024(1-r)\), where \(r\) is the
+compression ratio. A shorter cache reduces attention work and memory traffic in
+the decode loop. Because the benchmark starts the timer only after prefill and
+compression, the measured throughput mostly reflects this smaller cache. This
+explains why most methods become faster as the compression ratio increases.
+
+\paragraph{Why PPL degrades with compression.}
+Compression removes context information. If removed tokens are needed to predict
+the 256 target tokens, perplexity rises. This effect is visible for every
+method, especially at ratio 0.8. The quality drop is method-dependent because
+each press chooses a different retention policy. \texttt{SnapKVPress} uses
+recent attention as a task-adaptive importance signal, so it keeps many tokens
+that the current suffix already attends to. \texttt{StreamingLLMPress} is simpler
+but strong for long-context decoding because it preserves attention sinks and
+the most recent context, which are often disproportionately useful for stable
+generation. \texttt{KnormPress} is cheap but less context-aware, and therefore
+loses more quality when aggressive pruning removes semantically important
+tokens. \texttt{AdaKVPress} does not dominate \texttt{SnapKVPress} in this run:
+the head-wise adaptive masking can protect heads unevenly, but with Pythia-70m,
+small sample counts, and CPU execution, this extra flexibility does not translate
+into a better PPL--throughput tradeoff.
+
+\paragraph{Dataset differences.}
+The WikiText-2 results show larger quality degradation than PG-19 for the same
+compression ratios. Part of this can be explained by sampling: WikiText-2 uses
+three windows, while PG-19 uses a single local sample. The PG-19 result is
+therefore more sensitive to the particular passage. Another factor is that
+recent-window and sink-token methods are naturally aligned with long-context
+continuation: preserving the most recent segment and first few tokens can be
+enough for many local predictions, especially when the target follows directly
+after the context.
+
+\paragraph{Best operating points.}
+For WikiText-2, \texttt{SnapKVPress} at ratio 0.2 is the clearest conservative
+choice: PPL rises only from 32.30 to 33.65 while throughput increases from
+65.89 to 92.67 tokens/s. If speed is more important, \texttt{StreamingLLMPress}
+at ratio 0.6 reaches 99.29 tokens/s but increases PPL to 43.10. For PG-19,
+\texttt{StreamingLLMPress} at ratio 0.2 gives the best low-risk result, while
+\texttt{SnapKVPress} at ratios 0.4--0.6 gives a strong balance near
+98--100 tokens/s with PPL around 23.9.
+
+\section{Conclusion}
+
+The reproduced CPU benchmark confirms the expected tradeoff of KV cache
+compression: reducing the cache improves decode throughput after compression,
+but aggressive pruning can degrade perplexity. Among the four reproduced
+methods, \texttt{SnapKVPress} is the most consistent quality-preserving
+compressor, and \texttt{StreamingLLMPress} is a strong simple baseline with high
+decode throughput. \texttt{KnormPress} is computationally cheap but less robust
+at high compression, while \texttt{AdaKVPress} does not improve over its
+SnapKV-based scorer in this Pythia-70m CPU setting. Future evaluation should run
+more PG-19 samples and repeat the same sweep on CUDA, where memory bandwidth and
+kernel overhead may change the relative throughput ordering.
+
+\end{document}
