@@ -48,3 +48,4 @@
 - Pythia is the only model allowed for evaluation. Make sure all kvpresses are compatible with Pythia and test them with it.
 - The indexes to evaluate are PPL and Throughput.
 - The datasets to evaluate on are wikitext and pg19.
+- Use cuda by default for evaluation, but allow CPU fallback if cuda is not available.

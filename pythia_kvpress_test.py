@@ -14,13 +14,14 @@ from typing import Iterable
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvpress import AdaKVPress, KnormPress, SnapKVPress, StreamingLLMPress
 
 
 MODEL_NAME = "EleutherAI/pythia-70m"
 QUESTION = "\nSummarize the passage in one sentence."
+DEFAULT_COMPRESSION_RATIOS = [0.2, 0.4, 0.5, 0.6, 0.8]
 
 
 def find_repo_root() -> Path:
@@ -33,7 +34,9 @@ def find_repo_root() -> Path:
 REPO_ROOT = find_repo_root()
 # RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "pythia_kvpress_test"
 RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "cuda_base_test"
-DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "pythia_kvpress_test_results.csv"
+CPU_RESULTS_OUTPUT_DIR = REPO_ROOT / "results" / "cpu_base_test"
+DEFAULT_OUTPUT_CSV_NAME = "pythia_kvpress_test_results.csv"
+DEFAULT_OUTPUT_CSV = RESULTS_OUTPUT_DIR / DEFAULT_OUTPUT_CSV_NAME
 
 
 def resolve_device(device_arg: str) -> str:
@@ -61,12 +64,18 @@ def resolve_repo_path(path: str | Path) -> Path:
     return REPO_ROOT / resolved_path
 
 
-def resolve_output_csv_path(path: str | Path) -> Path:
+def get_results_output_dir(device: str) -> Path:
+    if device == "cpu":
+        return CPU_RESULTS_OUTPUT_DIR
+    return RESULTS_OUTPUT_DIR
+
+
+def resolve_output_csv_path(path: str | Path, output_dir: Path = RESULTS_OUTPUT_DIR) -> Path:
     output_path = Path(path).expanduser()
     if output_path.is_absolute():
         return output_path
     if output_path.parent == Path("."):
-        return RESULTS_OUTPUT_DIR / output_path
+        return output_dir / output_path
     return REPO_ROOT / output_path
 
 
@@ -76,6 +85,10 @@ class Result:
     press: str
     model: str
     compression_ratio: float
+    effective_compression_ratio: float
+    keep_ratio: float
+    device: str
+    dtype: str
     ppl: float
     throughput_tokens_s: float
     avg_latency_s: float
@@ -83,6 +96,8 @@ class Result:
     context_tokens: int
     target_tokens: int
     max_new_tokens: int
+    warmup: int
+    throughput_samples: int
 
 
 class NoPress:
@@ -359,50 +374,124 @@ def evaluate_ppl(model, tokenizer, token_windows, press, dataset_name: str, pres
 
 @torch.no_grad()
 def evaluate_throughput(
-    gen_pipe,
-    contexts: list[str],
+    model,
+    tokenizer,
+    token_windows,
     press,
     dataset_name: str,
     press_name: str,
     max_new_tokens: int,
     warmup: int,
+    throughput_samples: int = 3,
 ) -> tuple[float, float]:
-    for context in contexts[:warmup]:
-        gen_pipe(
-            context,
-            question=QUESTION,
-            press=press,
-            max_new_tokens=max_new_tokens,
+    if throughput_samples <= 0:
+        raise ValueError(f"throughput_samples must be positive, got {throughput_samples}.")
+
+    if max_new_tokens <= 0:
+        raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}.")
+
+    model.eval()
+    question_ids = tokenizer.encode(QUESTION + "\n", return_tensors="pt", add_special_tokens=False).to(model.device)
+
+    def decode_once(context_ids: torch.Tensor, timed: bool) -> float:
+        context_ids = context_ids.to(model.device)
+
+        # Build the compressed context cache outside the measured decode window.
+        with press(model):
+            context_outputs = model(
+                input_ids=context_ids,
+                use_cache=True,
+            )
+
+        cache = context_outputs.past_key_values
+        if cache is None:
+            raise RuntimeError("Model did not return past_key_values. " "Make sure the model supports use_cache=True.")
+
+        question_position_kwargs = _build_position_kwargs(
+            model=model,
+            absolute_start_pos=context_ids.shape[1],
+            cache_start_pos=_cache_seq_length(cache),
+            seq_len=question_ids.shape[1],
+            device=model.device,
         )
+        question_outputs = model(
+            input_ids=question_ids,
+            past_key_values=cache,
+            use_cache=True,
+            **question_position_kwargs,
+        )
+
+        next_token = question_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        absolute_position = context_ids.shape[1] + question_ids.shape[1]
+
+        if timed:
+            synchronize()
+            start = time.perf_counter()
+
+        for step in range(max_new_tokens):
+            position_kwargs = _build_position_kwargs(
+                model=model,
+                absolute_start_pos=absolute_position + step,
+                cache_start_pos=_cache_seq_length(cache),
+                seq_len=1,
+                device=model.device,
+            )
+            outputs = model(
+                input_ids=next_token,
+                past_key_values=cache,
+                use_cache=True,
+                **position_kwargs,
+            )
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        if not timed:
+            return 0.0
+
+        synchronize()
+        return time.perf_counter() - start
+
+    warmup_windows = token_windows[:warmup]
+    for context_ids, _, _ in warmup_windows:
+        decode_once(context_ids, timed=False)
 
     latencies = []
-    printed_check = False
 
-    for context in contexts:
-        synchronize()
-        start = time.perf_counter()
-
-        result = gen_pipe(
-            context,
-            question=QUESTION,
-            press=press,
-            max_new_tokens=max_new_tokens,
-        )
-
-        synchronize()
-        latencies.append(time.perf_counter() - start)
-
-        # if not printed_check:
-        #     print(f"\n[Throughput check] dataset={dataset_name} press={press_name}")
-        #     print(f"Question:{QUESTION}")
-        #     print(f"Answer:\n{_preview_text(result['answer'])}")
-        #     printed_check = True
+    for _ in range(throughput_samples):
+        for context_ids, _, _ in token_windows:
+            latencies.append(decode_once(context_ids, timed=True))
 
     total_latency = sum(latencies)
     avg_latency = total_latency / len(latencies)
-    throughput = (len(contexts) * max_new_tokens) / total_latency
+    throughput = (len(token_windows) * throughput_samples * max_new_tokens) / total_latency
 
     return avg_latency, throughput
+
+
+def get_press_dtype(press_name: str, default_dtype: torch.dtype, use_cuda: bool) -> torch.dtype:
+    if use_cuda and press_name == "adakv":
+        return torch.float32
+    return default_dtype
+
+
+def set_model_dtype(model, dtype: torch.dtype) -> None:
+    current_dtype = next(param.dtype for param in model.parameters() if param.is_floating_point())
+    if current_dtype == dtype:
+        return
+    model.to(dtype=dtype)
+
+
+def effective_compression_ratio(press_name: str, compression_ratio: float) -> float:
+    if press_name == "none":
+        return 0.0
+    return compression_ratio
+
+
+def get_compression_ratios(args) -> list[float]:
+    ratios = [args.compression_ratio] if args.compression_ratio is not None else args.compression_ratios
+    for ratio in ratios:
+        if not 0 <= ratio < 1:
+            raise ValueError(f"Compression ratio must be in [0, 1), got {ratio}.")
+    return ratios
 
 
 def run(args) -> list[Result]:
@@ -410,8 +499,10 @@ def run(args) -> list[Result]:
     use_auto_device = args.device == "auto"
     use_cuda = device.startswith("cuda")
     dtype = torch.float16 if use_cuda else torch.float32
+    compression_ratios = get_compression_ratios(args)
 
     print(f"Using device: {device} (requested: {args.device})")
+    print(f"Compression ratios: {', '.join(str(ratio) for ratio in compression_ratios)}")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -429,14 +520,6 @@ def run(args) -> list[Result]:
     elif not use_cuda:
         model = model.to("cpu")
 
-    pipeline_kwargs = {}
-    if use_auto_device and use_cuda:
-        pipeline_kwargs["device_map"] = "auto"
-    elif not use_auto_device:
-        pipeline_kwargs["device"] = device
-
-    gen_pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tokenizer, **pipeline_kwargs)
-
     results = []
 
     for dataset_name in args.datasets:
@@ -452,56 +535,98 @@ def run(args) -> list[Result]:
             local_pg19_txt=args.local_pg19_txt,
         )
 
-        contexts = [context for _, _, context in token_windows]
+        none_baseline_result = None
 
-        for press_name in args.presses:
-            clear_memory()
+        for compression_ratio in compression_ratios:
+            print(f"\nCompression ratio: {compression_ratio}")
 
-            press = build_press(
-                name=press_name,
-                compression_ratio=args.compression_ratio,
-                snapkv_window_size=args.snapkv_window_size,
-            )
+            for press_name in args.presses:
+                if press_name == "none" and none_baseline_result is not None:
+                    result = Result(
+                        dataset=dataset_name,
+                        press=press_name,
+                        model=args.model,
+                        compression_ratio=compression_ratio,
+                        effective_compression_ratio=0.0,
+                        keep_ratio=1.0,
+                        device=none_baseline_result.device,
+                        dtype=none_baseline_result.dtype,
+                        ppl=none_baseline_result.ppl,
+                        throughput_tokens_s=none_baseline_result.throughput_tokens_s,
+                        avg_latency_s=none_baseline_result.avg_latency_s,
+                        samples=none_baseline_result.samples,
+                        context_tokens=none_baseline_result.context_tokens,
+                        target_tokens=none_baseline_result.target_tokens,
+                        max_new_tokens=none_baseline_result.max_new_tokens,
+                        warmup=none_baseline_result.warmup,
+                        throughput_samples=none_baseline_result.throughput_samples,
+                    )
+                    results.append(result)
+                    print(
+                        f"{press_name:>12}: ppl={result.ppl:.4f}, "
+                        f"throughput={result.throughput_tokens_s:.2f} tokens/s, "
+                        f"avg_latency={result.avg_latency_s:.4f}s, "
+                        f"throughput_samples={result.throughput_samples} "
+                        f"(reused none baseline)"
+                    )
+                    continue
 
-            ppl = evaluate_ppl(
-                model=model,
-                tokenizer=tokenizer,
-                token_windows=token_windows,
-                press=press,
-                dataset_name=dataset_name,
-                press_name=press_name,
-            )
+                clear_memory()
+                press_dtype = get_press_dtype(press_name, dtype, use_cuda)
+                set_model_dtype(model, press_dtype)
 
-            clear_memory()
+                press = build_press(
+                    name=press_name,
+                    compression_ratio=compression_ratio,
+                    snapkv_window_size=args.snapkv_window_size,
+                )
 
-            press = build_press(
-                name=press_name,
-                compression_ratio=args.compression_ratio,
-                snapkv_window_size=args.snapkv_window_size,
-            )
+                ppl = evaluate_ppl(
+                    model=model,
+                    tokenizer=tokenizer,
+                    token_windows=token_windows,
+                    press=press,
+                    dataset_name=dataset_name,
+                    press_name=press_name,
+                )
 
-            avg_latency, throughput = evaluate_throughput(
-                gen_pipe=gen_pipe,
-                contexts=contexts,
-                press=press,
-                dataset_name=dataset_name,
-                press_name=press_name,
-                max_new_tokens=args.max_new_tokens,
-                warmup=args.warmup,
-            )
+                clear_memory()
 
-            print(
-                f"{press_name:>12}: ppl={ppl:.4f}, "
-                f"throughput={throughput:.2f} tokens/s, "
-                f"avg_latency={avg_latency:.4f}s"
-            )
+                press = build_press(
+                    name=press_name,
+                    compression_ratio=compression_ratio,
+                    snapkv_window_size=args.snapkv_window_size,
+                )
 
-            results.append(
-                Result(
+                avg_latency, throughput = evaluate_throughput(
+                    model=model,
+                    tokenizer=tokenizer,
+                    token_windows=token_windows,
+                    press=press,
+                    dataset_name=dataset_name,
+                    press_name=press_name,
+                    max_new_tokens=args.max_new_tokens,
+                    warmup=args.warmup,
+                    throughput_samples=args.throughput_samples,
+                )
+
+                print(
+                    f"{press_name:>12}: ppl={ppl:.4f}, "
+                    f"throughput={throughput:.2f} tokens/s, "
+                    f"avg_latency={avg_latency:.4f}s, "
+                    f"throughput_samples={args.throughput_samples}"
+                )
+
+                effective_ratio = effective_compression_ratio(press_name, compression_ratio)
+                result = Result(
                     dataset=dataset_name,
                     press=press_name,
                     model=args.model,
-                    compression_ratio=args.compression_ratio,
+                    compression_ratio=compression_ratio,
+                    effective_compression_ratio=effective_ratio,
+                    keep_ratio=1 - effective_ratio,
+                    device=device,
+                    dtype=str(press_dtype).replace("torch.", ""),
                     ppl=ppl,
                     throughput_tokens_s=throughput,
                     avg_latency_s=avg_latency,
@@ -509,15 +634,20 @@ def run(args) -> list[Result]:
                     context_tokens=args.context_tokens,
                     target_tokens=args.target_tokens,
                     max_new_tokens=args.max_new_tokens,
+                    warmup=args.warmup,
+                    throughput_samples=args.throughput_samples,
                 )
-            )
+                results.append(result)
+
+                if press_name == "none":
+                    none_baseline_result = result
 
     return results
 
 
-def write_csv(results: list[Result], output_csv: str | Path) -> Path:
+def write_csv(results: list[Result], output_csv: str | Path, output_dir: Path = RESULTS_OUTPUT_DIR) -> Path:
     fieldnames = list(Result.__dataclass_fields__)
-    output_path = resolve_output_csv_path(output_csv)
+    output_path = resolve_output_csv_path(output_csv, output_dir)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
@@ -560,16 +690,35 @@ def parse_args():
     parser.add_argument("--context-tokens", type=int, default=1024)
     parser.add_argument("--target-tokens", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--compression-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--throughput-samples",
+        type=int,
+        default=3,
+        help="Number of measured throughput passes over all sampled contexts. Default: 3.",
+    )
+    parser.add_argument(
+        "--compression-ratios",
+        nargs="+",
+        type=float,
+        default=DEFAULT_COMPRESSION_RATIOS,
+        help="Compression ratios to sweep. Default: 0.2 0.4 0.5 0.6 0.8.",
+    )
+    parser.add_argument(
+        "--compression-ratio",
+        type=float,
+        default=None,
+        help="Optional single-ratio override for backwards-compatible one-off runs.",
+    )
     parser.add_argument("--snapkv-window-size", type=int, default=64)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--local-pg19-txt", default=None)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--local-pg19-txt", default="data/pg19_sample.txt")
     parser.add_argument(
         "--output-csv",
-        default=str(DEFAULT_OUTPUT_CSV),
+        default=DEFAULT_OUTPUT_CSV_NAME,
         help=(
             "CSV output path. Passing only a filename, e.g. results.csv, saves to "
-            f"{RESULTS_OUTPUT_DIR / '<filename>.csv'}."
+            f"{RESULTS_OUTPUT_DIR / '<filename>.csv'} for CUDA and "
+            f"{CPU_RESULTS_OUTPUT_DIR / '<filename>.csv'} for CPU."
         ),
     )
 
@@ -580,10 +729,12 @@ def main():
     args = parse_args()
 
     results = run(args)
+    output_dir = get_results_output_dir(resolve_device(args.device))
 
     output_path = write_csv(
         results=results,
         output_csv=args.output_csv,
+        output_dir=output_dir,
     )
 
     print(f"\nWrote results to {output_path}")
