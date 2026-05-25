@@ -119,35 +119,19 @@
 
 \section{Introduction}
 
-Large language models rely on the key-value (KV) cache to avoid recomputing past hidden states during autoregressive decoding. While this cache is essential for efficient generation, its memory footprint grows linearly with the context length and quickly becomes a bottleneck in long-context inference. This issue is especially important for deployment settings where the model parameters are fixed:
-we often cannot retrain or modify the model architecture, but still need lower memory usage, faster prefill, and higher decoding throughput. KV cache compression therefore provides a practical direction for training-free inference optimization.
-
-Recent work has explored several forms of efficient Transformer inference, including optimized attention kernels, grouped-query variants, speculative decoding, and token-level KV cache pruning. In this project, we focus on the last category: compressing the sequence dimension of the KV cache during inference. Existing training-free KV compression methods usually assign an importance score to each cached token and remove tokens with the lowest scores. For example, norm-based methods use the geometry of key vectors, while attention-based
-methods estimate token importance from observed or expected attention patterns.
-However, a single scalar score may hide useful uncertainty. In particular, when different attention heads disagree about the importance of a token, aggressively evicting that token can be risky even if its average score is not high.
-
-We propose an uncertainty-aware KV cache compression wrapper for score-based presses in KVPress. Instead of replacing existing scoring rules, our method reuses a base scorer and augments its token ranking with a head-disagreement term. Given per-head token scores, we compute the mean importance across heads and the variance across heads, then rank tokens by
+Key-Value (KV) cache compression is a practical training-free approach for transformer optimization. However, a token with moderate average importance but large head-wise disagreement may still be risky to prune, because some heads may rely on it strongly. Motivated by the observation that token importance is not always
+  agreed upon across KV heads~\citep{ICLR2024_639a9a17}, we propose an uncertainty-aware KV cache compression wrapper for score-based presses in KVPress.It reuses a base scorer and augments its token ranking with a head-disagreement term. Given per-head token scores, we compute the mean importance across heads and the variance across heads, then rank tokens by
   \[
       s_i = \operatorname{Norm}\!\left(\mathbb{E}_{h}[s_{h,i}]\right)
       + \lambda \operatorname{Norm}\!\left(\operatorname{Var}_{h}
   [s_{h,i}]\right),
   \]
-  where $\lambda$ controls the degree of risk aversion. This design is simple, training-free, and compatible with multiple existing score-based KV compression methods, including KNorm, SnapKV, CUR, and LagKV. Intuitively, the method keeps tokens that are either consistently important across heads or uncertain because different heads assign them very different scores.
-
-  We evaluate the method under the assignment setting: all experiments use the fixed \texttt{EleutherAI/pythia-70m} model without parameter updates. We compare dense inference, standard KVPress baselines, and their uncertainty-aware variants on WikiText and PG-19. Following the requirements of efficient inference evaluation, we report both language modeling quality, measured by perplexity, and runtime efficiency, measured by time to first token (TTFT), time per output
-  token (TPOT), and generation throughput. This setup allows us to test whether adding uncertainty to token selection improves th quality--efficiency trade-off rather than only reducing cache size.
-
-  Our contributions are threefold. First, we implement a general uncertainty-aware wrapper for score-based KV cache compression that requires no training and no model parameter changes. Second, we integrate the method into the KVPress framework and make it compatible with several representative compression
-  baselines on Pythia-70M. Third, we provide a reproducible evaluation pipeline for perplexity and decoding-speed analysis on WikiText and PG-19, enabling direct comparison between dense inference, baseline compression, and uncertainty-aware compression.
-
-
+  where $\lambda$ controls the degree of risk aversion. This design is simple, training-free, and compatible with multiple existing score-based KV compression methods. Intuitively, the method keeps tokens that are either consistently important across heads or uncertain because different heads assign them very different scores. 
 
 \section{Method}
 
   We propose an uncertainty-aware KV cache compression method that
-  wraps an existing score-based KVPress and accounts for disagreement between KV heads when estimating token importance. The method is motivated by the observation that token importance is not always
-  agreed upon across KV heads~\citep{ICLR2024_639a9a17}. A token with moderate average importance but large head-wise disagreement may still be
-  risky to prune, because some heads may rely on it strongly. Therefore, instead of pruning only by the base importance
+  wraps an existing score-based KVPress and accounts for disagreement between KV heads when estimating token importance. Instead of pruning only by the base importance
   score, we augment the score with an uncertainty term estimated from inter-head variance.
 
   Let the base press produce token scores
@@ -155,8 +139,7 @@ We propose an uncertainty-aware KV cache compression wrapper for score-based pre
   S \in \mathbb{R}^{B \times H \times L},
   \]
   where \(B\) is the batch size, \(H\) is the number of KV heads, and \(L\) is the sequence length. These
-  scores can come from different base methods, including \texttt{KnormPress}, \texttt{CURPress}, \texttt{SnapKVPress},
-  or \texttt{LagKVPress}. For each token position \(t\), we compute the mean score across KV heads:
+  scores can come from different base methods. For each token position \(t\), we compute the mean score across KV heads:
   \[
   \mu_t = \mathrm{mean}_{h}(S_{h,t}),
   \]
@@ -175,14 +158,7 @@ We propose an uncertainty-aware KV cache compression wrapper for score-based pre
   combination less sensitive to the raw score scale of different base presses.
 
   After computing the adjusted score, the same token-level score is expanded back to all KV heads. The standard
-  \texttt{ScorerPress} compression mechanism is then used: for a target compression ratio, the method keeps the top-scoring KV positions and removes the lowest-scoring ones during prefill. Thus, what \texttt{UncertaintyAwarePress} does is to change the scoring rule used before top-\(k\) pruning.
-
-  The method is implemented as a wrapper around compatible \texttt{ScorerPress} methods that expose dense per-KV-head
-  token scores under the target model architecture. With \texttt{KnormPress}, uncertainty is
-  computed from head-wise key-norm-derived scores. With \texttt{CURPress}, it reflects disagreement in approximate
-  leverage scores of keys and values. With \texttt{SnapKVPress}, it measures disagreement in recent-window attention-based importance. With \texttt{LagKVPress}, it measures disagreement in lag-relative information scores. This design
-  makes the uncertainty-aware strategy modular: the base press defines what ``importance'' means, while the wrapper adds
-  a risk-aware correction for tokens whose importance is unstable across heads.
+  \texttt{ScorerPress} compression mechanism is then used: for a target compression ratio, the method keeps the top-scoring KV positions and removes the lowest-scoring ones during prefill.
 
 \section{Experiments}  \label{sec:experiments}
 
@@ -208,32 +184,7 @@ Experimental summary of uncertainty-aware KV cache compression.
 
 \subsection{Experimental Setup}
 
-\paragraph{Model.}
-Following the course requirement, all experiments are conducted on \texttt{EleutherAI/pythia-70m}. 
-We use the same model checkpoint for all methods to ensure a controlled comparison.
-
-\paragraph{Datasets.}
-We evaluate language modeling quality on WikiText-2 and PG-19. 
-WikiText-2 is used as the primary benchmark for perplexity evaluation, while PG-19 is used to test long-context behavior.
-
-\paragraph{Compared methods.}
-We compare the original base presses with their uncertainty-aware variants:
-\texttt{KnormPress}, \texttt{SnapKVPress}, \texttt{CURPress}, and \texttt{LagKVPress}.
-We also include a dense baseline without KV cache compression.
-All compression methods are implemented under the \texttt{kvpress} framework.
-In \texttt{ScorerPress}, KV pairs with the highest scores are retained through a top-$k$ selection rule, so our method can be applied to any base press that returns per-head token scores. % cite ScorerPress if needed
-
-\paragraph{Compute.}
-All experiments are conducted on a single NVIDIA GeForce RTX 4060 GPU using CUDA.
-This GPU provides sufficient memory and computation to run all base presses and uncertainty-aware variants under the specified compression ratios and sequence lengths.
-No multi-GPU or distributed setup was used.
-
-\paragraph{Default evaluation parameters.}
-Unless otherwise specified, all experiments use the same evaluation configuration shown in Table~\ref{tab:default_params}. 
-We evaluate on the test split with three samples. 
-For each sample, we use 1024 context tokens and 256 target tokens for perplexity evaluation, and generate at most 64 new tokens for inference efficiency measurement. 
-The default compression ratio is set to $0.5$, meaning that each press removes half of the KV cache entries. 
-For uncertainty-aware variants, the uncertainty weight is set to $\lambda=1.0$.
+\textbf{Model.} All experiments are conducted on \texttt{EleutherAI/pythia-70m}. We use the same model checkpoint for all methods to ensure a controlled comparison. \textbf{Datasets.} We evaluate language modeling quality on WikiText-2 and PG-19. WikiText-2 is used as the primary benchmark for perplexity evaluation, while PG-19 is used to test long-context behavior. \textbf{Compared methods.} The original kvpress methods we apply include \texttt{KNorm}, \texttt{CURPress}, \texttt{SnapKVPress}, and \texttt{LagKVPress}. We compare these methods with their uncertainty-aware variants. We also include a dense baseline without KV cache compression. All compression methods are implemented under the \texttt{kvpress} framework. \textbf{Compute.} All experiments are conducted on a single NVIDIA GeForce RTX 4060 GPU using CUDA. \textbf{Default evaluation parameters.} Unless otherwise specified, all experiments use the same evaluation configuration shown in Table~\ref{tab:default_params}. 
 
 \begin{table}[t]
 \centering
@@ -261,18 +212,10 @@ Parameter & Default Value & Description \\
 
 Table~\ref{tab:main_results} reports the main results under the default compression ratio $r=0.5$.
 Compared with vanilla \texttt{KNorm}, \texttt{UA-KNorm} reduces WikiText-2 perplexity from $50.52$ to $42.46$, corresponding to a relative improvement of $15.96\%$.
-This indicates that head-wise score variance provides useful complementary information when the base score is a static key-space heuristic.
-
-However, the improvement is not universal across all base presses.
-For \texttt{SnapKV}, \texttt{CUR}, and \texttt{LagKV}, the uncertainty-aware variants do not improve perplexity under the default setting.
-Specifically, \texttt{UA-SnapKV} increases PPL from $35.38$ to $36.67$, \texttt{UA-CUR} from $38.71$ to $41.31$, and \texttt{UA-LagKV} from $39.83$ to $40.94$.
-These results suggest that the proposed uncertainty term is most effective when the original score lacks dynamic attention information, as in \texttt{KNorm}.
-For stronger base methods whose scores already encode token salience through attention patterns, matrix leverage, or lag-relative information, the head-wise variance term may introduce additional noise rather than useful correction.
+However, for \texttt{SnapKV}, \texttt{CUR}, and \texttt{LagKV}, the uncertainty-aware variants do not improve perplexity under the default setting.
 
 In terms of efficiency, the uncertainty-aware wrapper does not change the target cache size, so the decoding-time cost remains close to the corresponding base press.
-For \texttt{KNorm}, the throughput changes only slightly from $222.15$ to $220.88$ tokens/s.
 This supports that the additional mean-variance computation mainly affects the scoring stage rather than the compressed decoding process.
-For other base presses, the throughput fluctuation is less consistent, which may be partly due to the small evaluation scale and the interaction between different scoring implementations.
 
 \begin{table}[t]
 \centering
@@ -281,60 +224,52 @@ Lower PPL, TTFT, and TPOT are better; higher throughput is better.
 TTFT and TPOT are reported in milliseconds.}
 \label{tab:main_results}
 \resizebox{\linewidth}{!}{
-\begin{tabular}{l l c c c c c c}
+\begin{tabular}{l c c c c c c}
 \toprule
-Base Press & Method & Ratio & WikiText-2 PPL $\downarrow$ & PG-19 PPL $\downarrow$ & TTFT (ms) $\downarrow$ & TPOT (ms) $\downarrow$ & Throughput $\uparrow$ \\
+Method & Ratio & WikiText-2 PPL $\downarrow$ & PG-19 PPL $\downarrow$ & TTFT (ms) $\downarrow$ & TPOT (ms) $\downarrow$ & Throughput $\uparrow$ \\
 \midrule
-None   & Dense       & 0.0 & 33.61 & 32.10 & 12.85 & 3.31 & 286.90 \\
+Dense       & 0.0 & 33.61 & 32.10 & 12.85 & 3.31 & 286.90 \\
 \midrule
-KNorm  & KNorm       & 0.5 & 50.52 & 39.45 & 13.64 & 2.90 & 323.19 \\
-KNorm  & UA-KNorm    & 0.5 & 42.46 & 33.83 & 14.69 & 2.82 & 329.74 \\
+KNorm       & 0.5 & 50.52 & 39.45 & 13.64 & 2.90 & 323.19 \\
+UA-KNorm    & 0.5 & 42.46 & 33.83 & 14.69 & 2.82 & 329.74 \\
 \midrule
-SnapKV & SnapKV      & 0.5 & 35.38 & 34.10 & 16.25 & 2.85 & 324.19 \\
-SnapKV & UA-SnapKV   & 0.5 & 36.67 & 36.28 & 17.73 & 2.88 & 318.11 \\
+SnapKV      & 0.5 & 35.38 & 34.10 & 16.25 & 2.85 & 324.19 \\
+UA-SnapKV   & 0.5 & 36.67 & 36.28 & 17.73 & 2.88 & 318.11 \\
 \midrule
-CUR    & CUR         & 0.5 & 38.71 & 37.57 & 14.96 & 2.90 & 320.70 \\
-CUR    & UA-CUR      & 0.5 & 41.31 & 40.71 & 17.15 & 2.96 & 311.53 \\
+CUR         & 0.5 & 38.71 & 37.57 & 14.96 & 2.90 & 320.70 \\
+UA-CUR      & 0.5 & 41.31 & 40.71 & 17.15 & 2.96 & 311.53 \\
 \midrule
-LagKV  & LagKV       & 0.5 & 39.83 & 32.56 & 17.89 & 3.17 & 291.43 \\
-LagKV  & UA-LagKV    & 0.5 & 40.94 & 33.09 & 17.43 & 3.06 & 301.76 \\
+LagKV       & 0.5 & 39.83 & 32.56 & 17.89 & 3.17 & 291.43 \\
+UA-LagKV    & 0.5 & 40.94 & 33.09 & 17.43 & 3.06 & 301.76 \\
 \bottomrule
 \end{tabular}
 }
 \end{table}
 
-\subsection{Effect of Compression Ratio}
-\label{subsec:compression_ratio}
-
-We further evaluate the uncertainty-aware variants under different compression ratios.
+\subsection{Effect of Compression Ratio} %Add thoughout to discuss trade-off between quality and efficiency
+\label{subsec:compression_ratio} 
+We further evaluate the uncertainty-aware variants under different compression ratios. Table~\ref{tab:ratio_study} shows the results.
 As expected, perplexity generally increases as the compression ratio becomes larger, since more KV pairs are removed from the cache.
-For example, \texttt{UA-KNorm} increases from $35.75$ at $r=0.2$ to $53.12$ at $r=0.8$, and \texttt{UA-CUR} increases from $36.46$ to $57.70$.
-This confirms that aggressive KV pruning causes a clear degradation in language modeling quality.
-
-Among the uncertainty-aware methods, \texttt{UA-SnapKV} achieves the lowest PPL at moderate compression ratios, reaching $35.87$ at $r=0.4$ and $38.53$ at $r=0.6$.
-This shows that although the uncertainty adjustment does not improve over vanilla \texttt{SnapKV}, the attention-window based base score itself remains strong.
-\texttt{UA-LagKV} is relatively robust at high compression, obtaining $49.77$ PPL at $r=0.8$, which is lower than \texttt{UA-KNorm}, \texttt{UA-SnapKV}, and \texttt{UA-CUR} under the same ratio.
-This suggests that lag-relative scoring may preserve useful information more stably when the cache budget becomes very small.
-
-Overall, the compression-ratio study shows that uncertainty-aware adjustment does not eliminate the quality--compression trade-off.
-Instead, its benefit depends strongly on the base scoring mechanism.
-It is most helpful when the base score is under-informative, but less reliable when the base press already provides a strong token ranking.
 
 \begin{table}[t]
 \centering
-\caption{Perplexity on WikiText-2 under different compression ratios.
-Lower PPL is better.}
+\caption{Perplexity and throughput on WikiText-2 under different compression ratios.
+Lower PPL is better; higher throughput is better.}
 \label{tab:ratio_study}
-\begin{tabular}{l c c c c}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{l c c c c c c c c}
 \toprule
-Method & $r=0.2$ & $r=0.4$ & $r=0.6$ & $r=0.8$ \\
+Method & \multicolumn{2}{c}{$r=0.2$} & \multicolumn{2}{c}{$r=0.4$} & \multicolumn{2}{c}{$r=0.6$} & \multicolumn{2}{c}{$r=0.8$} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
+ & PPL $\downarrow$ & Throughput $\uparrow$ & PPL $\downarrow$ & Throughput $\uparrow$ & PPL $\downarrow$ & Throughput $\uparrow$ & PPL $\downarrow$ & Throughput $\uparrow$ \\
 \midrule
-UA-KNorm  & 35.75 & 40.02 & 44.21 & 53.12 \\
-UA-SnapKV & 33.52 & 35.87 & 38.53 & 53.01 \\
-UA-CUR    & 36.46 & 39.55 & 44.04 & 57.70 \\
-UA-LagKV  & 35.02 & 39.47 & 44.24 & 49.77 \\
+UA-KNorm  & 35.75 & 295.11 & 40.02 & 311.80 & 44.21 & 306.06 & 53.12 & 302.56 \\
+UA-SnapKV & 33.52 & 285.96 & 35.87 & 299.56 & 38.53 & 306.58 & 53.01 & 310.11 \\
+UA-CUR    & 36.46 & 291.04 & 39.55 & 299.25 & 44.04 & 317.12 & 57.70 & 318.10 \\
+UA-LagKV  & 35.02 & 295.04 & 39.47 & 307.41 & 44.24 & 308.62 & 49.77 & 314.59 \\
 \bottomrule
 \end{tabular}
+}
 \end{table}
 \subsection{Ablation Study}
 \label{subsec:ablation}
@@ -344,22 +279,7 @@ Table~\ref{tab:lambda_ablation} studies the effect of the uncertainty weight $\l
 For \texttt{UA-KNorm}, adding the uncertainty term consistently improves over $\lambda=0$.
 The PPL decreases from $43.13$ at $\lambda=0$ to $40.99$ at $\lambda=0.5$ and further to $40.65$ at $\lambda=2.0$.
 This confirms that head-wise variance is a useful correction signal for \texttt{KNorm}.
-Since \texttt{KNorm} only uses the norm of key vectors, it may underestimate tokens that are important to only a subset of heads.
-The variance term compensates for this limitation by assigning higher scores to tokens with strong inter-head disagreement.
-
-For \texttt{UA-SnapKV}, changing $\lambda$ only leads to minor differences.
-The PPL remains within a narrow range from $36.65$ to $37.20$.
-This indicates that the uncertainty term has limited effect on the final ranking produced by \texttt{SnapKV}.
-A likely reason is that \texttt{SnapKV} already computes token importance from recent attention patterns, and the subsequent averaging and pooling operations make the score distribution relatively stable.
-As a result, head-wise variance provides little additional signal.
-
-For \texttt{UA-CUR}, increasing $\lambda$ generally hurts performance compared with $\lambda=0$.
-The best result is obtained at $\lambda=0$, with PPL $39.63$, while larger values increase PPL to around $41$.
-This suggests that the CUR-based score already captures structural importance through a leverage-style criterion, and emphasizing high-variance tokens may over-select outliers that are not necessarily useful for next-token prediction.
-
-For \texttt{UA-LagKV}, the effect of $\lambda$ is also weak.
-Small values such as $\lambda=0.25$ and $\lambda=0.5$ slightly improve over $\lambda=0$, but a larger value $\lambda=2.0$ worsens the PPL to $41.50$.
-This indicates that uncertainty can provide a small auxiliary signal for \texttt{LagKV}, but excessive uncertainty weighting may distort the original lag-relative ranking.
+For \texttt{UA-SnapKV}, \texttt{UA-CUR}, and \texttt{UA-LagKV}, changing $\lambda$ has little effect or slightly worsens PPL, suggesting that these methods already capture token importance through their original scores and that head-wise variance provides little, or even negative, additional signal.
 
 
 
@@ -382,13 +302,8 @@ UA-LagKV  & 40.97 & 40.73 & 40.73 & 40.94 & 41.50 \\
 
 \paragraph{Effect of normalization.}
 Table~\ref{tab:norm_ablation} evaluates the normalization choices using \texttt{UA-KNorm}.
-The full variant, which normalizes both the mean score and the variance term, obtains a PPL of $42.46$.
-Removing mean normalization slightly improves the result to $42.07$, while removing variance normalization further reduces PPL to $40.91$.
-The raw combination without either normalization achieves $41.29$.
-
 These results show that normalization is not always beneficial for \texttt{KNorm}.
-One possible explanation is that min--max normalization changes the relative scale of the original key-norm score and the variance term.
-For \texttt{KNorm}, the raw score magnitude itself may already contain useful information about token importance.
+The raw score magnitude itself may already contain useful information about token importance.
 Over-normalizing the score distribution may weaken this information and make the final ranking less faithful to the original key-space geometry.
 Therefore, although normalization makes the method more comparable across different base presses, it may not be optimal for every individual press.
 
@@ -416,12 +331,9 @@ To further understand when uncertainty-aware adjustment is effective, we compare
 For \texttt{KNorm}, the kept-set difference reaches $0.487$, meaning that nearly half of the selected tokens are changed after applying uncertainty-aware adjustment.
 This large ranking change is accompanied by a substantial PPL reduction of $8.06$.
 Therefore, for \texttt{KNorm}, the uncertainty term meaningfully changes the pruning decision and corrects the weakness of the original key-norm score.
-
 For \texttt{SnapKV}, the kept-set difference is much smaller, only $0.266$.
 Meanwhile, PPL increases by $1.29$.
-This suggests that the uncertainty-aware adjustment does not introduce a beneficial alternative ranking for \texttt{SnapKV}.
-Since \texttt{SnapKV} already uses recent attention patterns to estimate token importance, the additional variance term either changes too few tokens or changes tokens in a less useful direction.
-
+For \texttt{CUR} and \texttt{LagKV}, the kept-set differences are $0.301$ and $0.403$, respectively, but both lead to worse PPL.
 
 
 \begin{table}[t]
@@ -441,45 +353,44 @@ LagKV  & 0.403 & 39.83 & 40.94 &  1.10 \\
 \end{tabular}
 \end{table}
 
-For \texttt{CUR} and \texttt{LagKV}, the kept-set differences are $0.301$ and $0.403$, respectively, but both lead to worse PPL.
-This shows that a larger selection difference alone does not guarantee better compression quality.
-The key factor is whether the changed tokens are actually more useful for future prediction.
-In these cases, uncertainty-aware adjustment changes the retained set, but the induced changes do not align well with language modeling utility.
-
 \subsection{Discussion}
 \label{subsec:discussion}
 
 The results show that uncertainty-aware adjustment is not uniformly effective across base presses.
-Although the same head-wise variance term is applied to all methods, its usefulness depends on whether the variance captures information that is missing from the original score.
+The uncertainty term is most effective when the original score lacks dynamic attention information, as in \texttt{KNorm}.
+For stronger base methods whose scores already encode token salience through attention patterns, matrix leverage, or lag-relative information, the head-wise variance term may introduce additional noise rather than useful correction.
+Another possible reason is that \texttt{SnapKV}, \texttt{CUR}, and \texttt{LagKV} originally produce per-head token scores, so different attention heads can retain different tokens according to their own salience estimates.
+After applying the uncertainty-aware wrapper, these per-head scores are reduced to a shared mean-variance token score, eliminating potentially useful differences between heads.
 
-\paragraph{KNorm.}
-\texttt{KNormPress} benefits most clearly from uncertainty-aware adjustment.
-Since KNorm scores tokens only by the norm of key vectors, it is a static and query-free heuristic.
-It may therefore underestimate tokens that are important to only a subset of heads.
-The variance term helps recover such head-specific tokens, explaining why \texttt{UA-KNorm} improves over vanilla \texttt{KNorm} on both WikiText-2 and PG-19.
+% \paragraph{KNorm.}
+% \texttt{KNormPress} benefits most clearly from uncertainty-aware adjustment.
+% Since KNorm scores tokens only by the norm of key vectors, it is a static and query-free heuristic.
+% It may therefore underestimate tokens that are important to only a subset of heads.
+% The variance term helps recover such head-specific tokens, explaining why \texttt{UA-KNorm} improves over vanilla \texttt{KNorm} on both WikiText-2 and PG-19.
 
-\paragraph{SnapKV.}
-\texttt{SnapKVPress} shows little or negative improvement.
-This happens because original SnapKV selects tokens independently for each KV head. So different KV heads can keep different tokens. This is especially important for GQA/MQA, where each KV head serves a group of query heads with potentially different attention patterns. In contrast, \texttt{UncertaintyAwarePress} first averages and computes variance across KV heads, then it expands the same adjusted scores back to all heads. Some heads may lose tokens that are important specifically to them, while tokens useful only to a few heads are kept across all heads. 
+% \paragraph{SnapKV.}
+% \texttt{SnapKVPress} shows little or negative improvement.
+% This happens because original SnapKV selects tokens independently for each KV head. So different KV heads can keep different tokens. This is especially important for GQA/MQA, where each KV head serves a group of query heads with potentially different attention patterns. In contrast, \texttt{UncertaintyAwarePress} first averages and computes variance across KV heads, then it expands the same adjusted scores back to all heads. Some heads may lose tokens that are important specifically to them, while tokens useful only to a few heads are kept across all heads. 
+% \texttt{SnapKV} already computes token importance from recent attention patterns, and the subsequent averaging and pooling operations make the scoredistribution relatively stable.
+% As a result, head-wise variance provides little additional signal.
 
-\paragraph{CUR.}
-\texttt{CURPress} shows improvement on PG-19 but degradation on WikiText-2.
-The reason may be the possible discard of sink tokens in \texttt{UncertaintyAwareness}. \texttt{CURPress} sets the first few sink tokens to a high score:
-\texttt{scores[:, :, : self.num\_sinks] = 1.0}. But in \texttt{UncertaintyAwarePress}, the final score adds head-wise variance. Since sink tokens have the same score across heads, their variance is zero. Non-sink tokens with
-  large head disagreement can receive a higher uncertainty bonus and may outrank the sink tokens. As a result, some sink tokens may be pruned, which breaks CUR’s intended sink preservation and can hurt performance.
+% \paragraph{CUR.}
+% \texttt{CURPress} shows improvement on PG-19 but degradation on WikiText-2.
+% The reason may be the possible discard of sink tokens in \texttt{UncertaintyAwareness}. \texttt{CURPress} sets the first few sink tokens to a high score:
+% \texttt{scores[:, :, : self.num\_sinks] = 1.0}. But in \texttt{UncertaintyAwarePress}, the final score adds head-wise variance. Since sink tokens have the same score across heads, their variance is zero. Non-sink tokens with
+%   large head disagreement can receive a higher uncertainty bonus and may outrank the sink tokens. As a result, some sink tokens may be pruned, which breaks CUR’s intended sink preservation and can hurt performance.
 
-\paragraph{LagKV.}
- \texttt{LagKVPress} also shows little or negative improvement. One possible reason is that it ranks scores within each block by default:
-  \texttt{score = score.argsort(dim=-1).argsort(dim=-1) / self.lag\_size}.
-  As a result, the original score magnitudes are discarded. The score distributions across heads are therefore normalized into similar discrete rank patterns. Consequently, head-wise variance computed afterward mainly reflects differences
-  in block-wise token rankings across heads, rather than true model uncertainty.
+% \paragraph{LagKV.}
+%  \texttt{LagKVPress} also shows little or negative improvement. One possible reason is that it ranks scores within each block by default:
+%   \texttt{score = score.argsort(dim=-1).argsort(dim=-1) / self.lag\_size}.
+%   As a result, the original score magnitudes are discarded. The score distributions across heads are therefore normalized into similar discrete rank patterns. Consequently, head-wise variance computed afterward mainly reflects differences
+%   in block-wise token rankings across heads, rather than true model uncertainty.
 
-\paragraph{Summary.}
-Overall, uncertainty-aware adjustment is most useful for simple, static, and under-informative base scores.
-It is less useful when the base press already captures token salience through attention or structural scoring.
-Therefore, head-wise variance should be viewed as a compatibility-dependent correction signal rather than a universally reliable importance measure.
+% \paragraph{Summary.}
+% Overall, uncertainty-aware adjustment is most useful for simple, static, and under-informative base scores.
+% It is less useful when the base press already captures token salience through attention or structural scoring.
+% Therefore, head-wise variance should be viewed as a compatibility-dependent correction signal rather than a universally reliable importance measure.
 
-\section*{References}
 \begin{thebibliography}{1}
 \small
 
