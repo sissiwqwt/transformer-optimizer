@@ -7,7 +7,7 @@
 % The authors should use one of these tracks.
 % Before accepting by the NeurIPS conference, select one of the options below.
 % 0. "default" for submission
- \usepackage{neurips_2025}
+ \usepackage[preprint]{neurips_2025}
 % the "default" option is equal to the "main" option, which is used for the Main Track with double-blind reviewing.
 % 1. "main" option is used for the Main Track
 %  \usepackage[main]{neurips_2025}
@@ -56,9 +56,9 @@
 \usepackage{xcolor}         % colors
 \usepackage{graphicx}
 \usepackage{amsmath}
-
+\usepackage{CJKutf8}
 % Note. For the workshop paper template, both \title{} and \workshoptitle{} are required, with the former indicating the paper title shown in the title and the latter indicating the workshop title displayed in the footnote. 
-\title{Formatting Instructions For NeurIPS 2025}
+\title{Uncertainty-Aware KV Cache Compression for Training-Free Efficient Language Model Inference}
 
 
 % The \author macro works with any number of authors. There are two commands
@@ -70,50 +70,39 @@
 % \AND instead of \And before the third author name.
 
 
-\author{%
-  David S.~Hippocampus\thanks{Use footnote for providing further information
-    about author (webpage, alternative address)---\emph{not} for acknowledging
-    funding agencies.} \\
-  Department of Computer Science\\
-  Cranberry-Lemon University\\
-  Pittsburgh, PA 15213 \\
-  \texttt{hippo@cs.cranberry-lemon.edu} \\
-  % examples of more authors
-  % \And
-  % Coauthor \\
-  % Affiliation \\
-  % Address \\
-  % \texttt{email} \\
-  % \AND
-  % Coauthor \\
-  % Affiliation \\
-  % Address \\
-  % \texttt{email} \\
-  % \And
-  % Coauthor \\
-  % Affiliation \\
-  % Address \\
-  % \texttt{email} \\
-  % \And
-  % Coauthor \\
-  % Affiliation \\
-  % Address \\
-  % \texttt{email} \\
-}
-
-
 \begin{document}
 
 
+\begin{CJK*}{UTF8}{gbsn}
+\author{%
+  范文茜 \\
+  524531910002 \\
+  \And
+  裘嘉敏 \\
+  524030910068 \\
+  \And
+  陆紫萌 \\
+  524531910001 \\
+}
 \maketitle
+\end{CJK*}
 
 
 \begin{abstract}
-  The abstract paragraph should be indented \nicefrac{1}{2}~inch (3~picas) on
-  both the left- and right-hand margins. Use 10~point type, with a vertical
-  spacing (leading) of 11~points.  The word \textbf{Abstract} must be centered,
-  bold, and in point size 12. Two line spaces precede the abstract. The abstract
-  must be limited to one paragraph.
+  The KV cache compression during
+  transformer inference can be unreliable when token
+  importance differs across KV heads. We propose an uncertainty-aware wrapper
+  for score-based KVPress methods that augments each token's average importance
+  with a head-wise variance term, allowing the compressor to preserve tokens
+  whose relevance is uncertain across heads. The method is training-free,
+  simple to implement, and compatible with multiple existing presses. Experiments
+  on Pythia-70m using WikiText-2 and PG-19 show that the uncertainty term
+  substantially improves KNorm compression, reducing WikiText-2 perplexity from
+  50.52 to 42.46 at a 0.5 compression ratio, while providing limited or negative
+  gains for stronger base presses such as SnapKV, CUR, and LagKV. These results
+  suggest that head-wise disagreement is a useful correction signal for simple
+  static scoring methods, but its benefit depends on the base compression
+  mechanism.
 \end{abstract}
 
 
@@ -168,7 +157,7 @@ Our experiments focus on three questions:
 (ii) whether the improvement is consistent across different scoring mechanisms;
 and (iii) whether the additional scoring computation affects inference efficiency.
 
-\begin{figure}
+\begin{figure}[!htbp]
     \centering
     \includegraphics[width=1\linewidth]{ua_press_summary.pdf}
     \caption{
@@ -186,7 +175,7 @@ Experimental summary of uncertainty-aware KV cache compression.
 
 \textbf{Model.} All experiments are conducted on \texttt{EleutherAI/pythia-70m}. We use the same model checkpoint for all methods to ensure a controlled comparison. \textbf{Datasets.} We evaluate language modeling quality on WikiText-2 and PG-19. WikiText-2 is used as the primary benchmark for perplexity evaluation, while PG-19 is used to test long-context behavior. \textbf{Compared methods.} The original kvpress methods we apply include \texttt{KNorm}, \texttt{CURPress}, \texttt{SnapKVPress}, and \texttt{LagKVPress}. We compare these methods with their uncertainty-aware variants. We also include a dense baseline without KV cache compression. All compression methods are implemented under the \texttt{kvpress} framework. \textbf{Compute.} All experiments are conducted on a single NVIDIA GeForce RTX 4060 GPU using CUDA. \textbf{Default evaluation parameters.} Unless otherwise specified, all experiments use the same evaluation configuration shown in Table~\ref{tab:default_params}. 
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Default evaluation parameters used in our experiments.}
 \label{tab:default_params}
@@ -217,7 +206,7 @@ However, for \texttt{SnapKV}, \texttt{CUR}, and \texttt{LagKV}, the uncertainty-
 In terms of efficiency, the uncertainty-aware wrapper does not change the target cache size, so the decoding-time cost remains close to the corresponding base press.
 This supports that the additional mean-variance computation mainly affects the scoring stage rather than the compressed decoding process.
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Main results on WikiText-2 and PG-19 under compression ratio $r=0.5$.
 Lower PPL, TTFT, and TPOT are better; higher throughput is better.
@@ -249,9 +238,8 @@ UA-LagKV    & 0.5 & 40.94 & 33.09 & 17.43 & 3.06 & 301.76 \\
 \subsection{Effect of Compression Ratio} %Add thoughout to discuss trade-off between quality and efficiency
 \label{subsec:compression_ratio} 
 We further evaluate the uncertainty-aware variants under different compression ratios. Table~\ref{tab:ratio_study} shows the results.
-As expected, perplexity generally increases as the compression ratio becomes larger, since more KV pairs are removed from the cache.
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Perplexity and throughput on WikiText-2 under different compression ratios.
 Lower PPL is better; higher throughput is better.}
@@ -271,6 +259,7 @@ UA-LagKV  & 35.02 & 295.04 & 39.47 & 307.41 & 44.24 & 308.62 & 49.77 & 314.59 \\
 \end{tabular}
 }
 \end{table}
+As expected, throughput generally improves as the compression ratio increases, although the trend is not perfectly monotonic for every method. This is because a larger ratio removes more KV cache entries, reducing attention computation and memory access during generation. However, the same increase in ratio also worsens perplexity, so the compression ratio should be chosen as a trade-off between quality and efficiency.
 \subsection{Ablation Study}
 \label{subsec:ablation}
 
@@ -283,7 +272,7 @@ For \texttt{UA-SnapKV}, \texttt{UA-CUR}, and \texttt{UA-LagKV}, changing $\lambd
 
 
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Ablation on uncertainty weight $\lambda$ on WikiText-2 under compression ratio $r=0.5$.
 Lower PPL is better.}
@@ -307,7 +296,7 @@ The raw score magnitude itself may already contain useful information about toke
 Over-normalizing the score distribution may weaken this information and make the final ranking less faithful to the original key-space geometry.
 Therefore, although normalization makes the method more comparable across different base presses, it may not be optimal for every individual press.
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Ablation on mean-score and variance normalization for UA-KNorm on WikiText-2.
 Lower PPL is better.}
@@ -324,34 +313,33 @@ Raw combination              & $\times$   & $\times$   & 41.29 \\
 \end{tabular}
 \end{table}
 
-\subsection{Selection Difference Analysis}
-\label{subsec:selection_analysis}
+% \subsection{Selection Difference Analysis}
+% \label{subsec:selection_analysis}
 
-To further understand when uncertainty-aware adjustment is effective, we compare the retained token sets selected by each base press and its uncertainty-aware variant.
-For \texttt{KNorm}, the kept-set difference reaches $0.487$, meaning that nearly half of the selected tokens are changed after applying uncertainty-aware adjustment.
-This large ranking change is accompanied by a substantial PPL reduction of $8.06$.
-Therefore, for \texttt{KNorm}, the uncertainty term meaningfully changes the pruning decision and corrects the weakness of the original key-norm score.
-For \texttt{SnapKV}, the kept-set difference is much smaller, only $0.266$.
-Meanwhile, PPL increases by $1.29$.
-For \texttt{CUR} and \texttt{LagKV}, the kept-set differences are $0.301$ and $0.403$, respectively, but both lead to worse PPL.
+% To further understand when uncertainty-aware adjustment is effective, we compare the retained token sets selected by each base press and its uncertainty-aware variant.
+% For \texttt{KNorm}, the kept-set difference reaches $0.487$, meaning that nearly half of the selected tokens are changed after applying uncertainty-aware adjustment.
+% This large ranking change is accompanied by a substantial PPL reduction of $8.06$.
+% Therefore, for \texttt{KNorm}, the uncertainty term meaningfully changes the pruning decision and corrects the weakness of the original key-norm score.
+% For \texttt{SnapKV}, the kept-set difference is much smaller, only $0.266$.
+% Meanwhile, PPL increases by $1.29$.
+% For \texttt{CUR} and \texttt{LagKV}, the kept-set differences are $0.301$ and $0.403$, respectively, but both lead to worse PPL.
 
-
-\begin{table}[t]
-\centering
-\caption{Retained-token set difference between base presses and uncertainty-aware variants on WikiText-2.
-Negative PPL change indicates improvement.}
-\label{tab:selection_diff}
-\begin{tabular}{l c c c c}
-\toprule
-Base Press & Kept-set Difference $\uparrow$ & Base PPL & UA PPL & PPL Change $\downarrow$ \\
-\midrule
-KNorm  & 0.487 & 50.52 & 42.46 & -8.06 \\
-SnapKV & 0.266 & 35.38 & 36.67 &  1.29 \\
-CUR    & 0.301 & 38.71 & 41.31 &  2.60 \\
-LagKV  & 0.403 & 39.83 & 40.94 &  1.10 \\
-\bottomrule
-\end{tabular}
-\end{table}
+% \begin{table}[!htbp]
+% \centering
+% \caption{Retained-token set difference between base presses and uncertainty-aware variants on WikiText-2.
+% Negative PPL change indicates improvement.}
+% \label{tab:selection_diff}
+% \begin{tabular}{l c c c c}
+% \toprule
+% Base Press & Kept-set Difference $\uparrow$ & Base PPL & UA PPL & PPL Change $\downarrow$ \\
+% \midrule
+% KNorm  & 0.487 & 50.52 & 42.46 & -8.06 \\
+% SnapKV & 0.266 & 35.38 & 36.67 &  1.29 \\
+% CUR    & 0.301 & 38.71 & 41.31 &  2.60 \\
+% LagKV  & 0.403 & 39.83 & 40.94 &  1.10 \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
 
 \subsection{Discussion}
 \label{subsec:discussion}
@@ -403,5 +391,10 @@ pp.\ 22975--22988, 2024.
 \newblock URL \url{https://proceedings.iclr.cc/paper_files/paper/2024/file/639a9a172c044fbb64175b5fad42e9a5-Paper-Conference.pdf}.
 
 \end{thebibliography}
+
+\appendix
+  \section{Contribution Statement}
+
+  The work was completed collaboratively by all group members. Fan Wenqian was responsible for the implementation of the uncertainty-aware KV cache compression method and writing the method description. Qiu Jiamin was responsible for running experiments, collecting results, and analyzing the data. Lu Zimeng was responsible for writing and revising the report, including the introduction, method description, and discussion. All members participated in literature review, result analysis, and final proofreading.
 
 \end{document}
