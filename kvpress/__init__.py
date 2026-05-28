@@ -5,6 +5,7 @@
 from kvpress.attention_patch import patch_attention_functions
 from kvpress.pipeline import KVPressTextGenerationPipeline
 from kvpress.presses.adakv_press import AdaKVPress
+from kvpress.presses.anchor_dedup_press import AnchorDedupPress
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
 from kvpress.presses.block_press import BlockPress
 from kvpress.presses.cam_press import CAMPress
@@ -43,6 +44,7 @@ from kvpress.presses.streaming_llm_press import StreamingLLMPress
 from kvpress.presses.think_press import ThinKPress
 from kvpress.presses.tova_press import TOVAPress
 from kvpress.presses.uncertainty_aware_press import UncertaintyAwarePress
+from kvpress.presses.uncertainty_aware_press_tmp import UncertaintyAwarePressTmp
 
 # Patch the attention functions to support head-wise compression
 patch_attention_functions()
@@ -52,6 +54,7 @@ __all__ = [
     "CriticalKVPress",
     "CURPress",
     "AdaKVPress",
+    "AnchorDedupPress",
     "BasePress",
     "ComposedPress",
     "ScorerPress",

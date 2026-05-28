@@ -177,4 +177,5 @@ proposal/*
 report/*
 cache/*
 !report/*.tex
+!report/*.pdf
 !report/README.md

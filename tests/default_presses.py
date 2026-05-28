@@ -4,6 +4,7 @@
 import numpy as np
 
 from kvpress import (
+    AnchorDedupPress,
     CompactorPress,
     CURPress,
     DuoAttentionPress,
@@ -73,6 +74,13 @@ class TestFastKVzipPress(FastKVzipPress):
 default_presses = [
     {"cls": TestDuoAttentionPress, "kwargs": [{"head_compression_ratio": 0.2}, {"head_compression_ratio": 0.8}]},
     {"cls": KnormPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
+    {
+        "cls": AnchorDedupPress,
+        "kwargs": [
+            {"compression_ratio": 0.2, "window_size": 2, "chunk_size": 16},
+            {"compression_ratio": 0.8, "window_size": 2, "chunk_size": 16},
+        ],
+    },
     {"cls": UncertaintyAwarePress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {"cls": ExpectedAttentionPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {"cls": ExpectedAttentionStatsPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},

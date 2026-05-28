@@ -63,7 +63,7 @@ DEFAULT_CACHE_DIR = Path(os.environ.get("KVPRESS_CACHE_DIR", str(PROJECT_ROOT / 
 DEFAULT_LAMBDA_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "lambda_ablation_results.csv"
 DEFAULT_NORM_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "normalization_ablation_results.csv"
 DEFAULT_SELECTION_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "selection_difference_results.csv"
-DEFAULT_RATIO_OUTPUT_CSV = RESULTS_OUTPUT_DIR / "compression_ratio_ablation_results.csv"
+DEFAULT_RATIO_OUTPUT_CSV = REPO_ROOT / "results" / "ratio_abla" / "compression_ratio_ablation_results2.csv"
 
 
 @dataclass
@@ -720,14 +720,16 @@ def print_compression_ratio_ablation_table(
     results: list[CompressionRatioAblationResult],
     ratio_values: list[float],
 ):
-    headers = ["Method", *[f"r={value:g}" for value in ratio_values]]
+    headers = ["Method", "Metric", *[f"r={value:g}" for value in ratio_values]]
     rows = []
     for result in results:
         result_values = result.__dict__
+        digits = 2 if result.metric == "throughput" else 4
         rows.append(
             [
                 result.method,
-                *[format_metric(result_values[ratio_column_name(value)]) for value in ratio_values],
+                result.metric,
+                *[format_metric(result_values[ratio_column_name(value)], digits=digits) for value in ratio_values],
             ]
         )
 
@@ -738,8 +740,7 @@ def print_compression_ratio_ablation_table(
     def render_row(row):
         return " | ".join(cell.ljust(width) for cell, width in zip(row, widths))
 
-    metric = results[0].metric if results else "unknown"
-    print(f"\nCompression ratio ablation ({metric})")
+    print("\nCompression ratio ablation")
     print(render_row(headers))
     print("-+-".join("-" * width for width in widths))
     for row in rows:
@@ -999,13 +1000,23 @@ def validate_ratio_values(ratio_values: list[float]):
 
 
 def collect_required_windows(args, tokenizer, cache_dir: Path, metric: str) -> dict[str, list[TokenWindow]]:
+    return collect_required_windows_for_metrics(args, tokenizer, cache_dir, [metric])
+
+
+def collect_required_windows_for_metrics(
+    args,
+    tokenizer,
+    cache_dir: Path,
+    metrics: Iterable[str],
+) -> dict[str, list[TokenWindow]]:
     required_datasets = set()
-    if metric == "wikitext_ppl":
-        required_datasets.add("wikitext")
-    elif metric == "pg19_ppl":
-        required_datasets.add("pg19")
-    elif metric in {"ttft", "tpot", "throughput"}:
-        required_datasets.update(args.latency_datasets)
+    for metric in metrics:
+        if metric == "wikitext_ppl":
+            required_datasets.add("wikitext")
+        elif metric == "pg19_ppl":
+            required_datasets.add("pg19")
+        elif metric in {"ttft", "tpot", "throughput"}:
+            required_datasets.update(args.latency_datasets)
 
     dataset_windows = {}
     for dataset_name in sorted(required_datasets):
@@ -1148,10 +1159,10 @@ def run_compression_ratio_ablation(args) -> list[CompressionRatioAblationResult]
 
     device = str(model.device)
     print_parameters(args, device=device, dtype=dtype, cache_dir=cache_dir)
-    print(f"ratio_metric: {args.ratio_metric}")
+    print(f"ratio_metrics: {', '.join(args.ratio_metrics)}")
     print(f"ratio_values: {', '.join(str(value) for value in args.ratio_values)}")
 
-    dataset_windows = collect_required_windows(args, tokenizer, cache_dir, args.ratio_metric)
+    dataset_windows = collect_required_windows_for_metrics(args, tokenizer, cache_dir, args.ratio_metrics)
     original_compression_ratio = args.compression_ratio
     results = []
 
@@ -1159,36 +1170,41 @@ def run_compression_ratio_ablation(args) -> list[CompressionRatioAblationResult]
         for method_key in args.ratio_methods:
             _, method = DISPLAY_NAMES[method_key]
             row_values = {
-                "ratio_0_2": float("nan"),
-                "ratio_0_4": float("nan"),
-                "ratio_0_6": float("nan"),
-                "ratio_0_8": float("nan"),
+                metric: {
+                    "ratio_0_2": float("nan"),
+                    "ratio_0_4": float("nan"),
+                    "ratio_0_6": float("nan"),
+                    "ratio_0_8": float("nan"),
+                }
+                for metric in args.ratio_metrics
             }
 
             print(f"\nEvaluating {method} compression-ratio ablation...")
             for ratio_value in args.ratio_values:
-                clear_memory()
                 args.compression_ratio = ratio_value
-                press = build_method_press(method_key, args)
-                value = evaluate_metric(args, model, tokenizer, dataset_windows, press, args.ratio_metric)
-                row_values[ratio_column_name(ratio_value)] = value
-                print(f"  r={ratio_value:g}: {args.ratio_metric}={value:.4f}")
+                for metric in args.ratio_metrics:
+                    clear_memory()
+                    press = build_method_press(method_key, args)
+                    value = evaluate_metric(args, model, tokenizer, dataset_windows, press, metric)
+                    row_values[metric][ratio_column_name(ratio_value)] = value
+                    print(f"  r={ratio_value:g}: {metric}={value:.4f}")
 
-            results.append(
-                CompressionRatioAblationResult(
-                    method=method,
-                    metric=args.ratio_metric,
-                    model=args.model,
-                    device=device,
-                    dtype=str(dtype),
-                    uncertainty_weight=args.uncertainty_weight,
-                    samples_per_dataset=args.num_samples,
-                    context_tokens=args.context_tokens,
-                    target_tokens=args.target_tokens,
-                    max_new_tokens=args.max_new_tokens,
-                    **row_values,
+            for metric in args.ratio_metrics:
+                results.append(
+                    CompressionRatioAblationResult(
+                        method=method,
+                        metric=metric,
+                        model=args.model,
+                        device=device,
+                        dtype=str(dtype),
+                        uncertainty_weight=args.uncertainty_weight,
+                        samples_per_dataset=args.num_samples,
+                        context_tokens=args.context_tokens,
+                        target_tokens=args.target_tokens,
+                        max_new_tokens=args.max_new_tokens,
+                        **row_values[metric],
+                    )
                 )
-            )
     finally:
         args.compression_ratio = original_compression_ratio
 
@@ -1382,17 +1398,17 @@ def parse_args():
     )
     parser.add_argument(
         "--table",
-        default="main",
+        default="ratio",
         choices=["main", "lambda", "ratio", "norm", "selection", "all"],
         help="Which result table to print.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--use-fast-tokenizer", action="store_true")
-    parser.add_argument("--datasets", nargs="+", default=["wikitext", "pg19"], choices=["wikitext", "pg19"])
+    parser.add_argument("--datasets", nargs="+", default=["wikitext"], choices=["wikitext", "pg19"])
     parser.add_argument(
         "--latency-datasets",
         nargs="+",
-        default=["wikitext", "pg19"],
+        default=["wikitext"],
         choices=["wikitext", "pg19"],
         help="Datasets whose sampled contexts are pooled for TTFT, TPOT, and throughput.",
     )
@@ -1438,10 +1454,11 @@ def parse_args():
         help="Methods to evaluate in the compression-ratio ablation table.",
     )
     parser.add_argument(
-        "--ratio-metric",
-        default="wikitext_ppl",
+        "--ratio-metrics",
+        nargs="+",
+        default=["wikitext_ppl", "throughput"],
         choices=["wikitext_ppl", "pg19_ppl", "ttft", "tpot", "throughput"],
-        help="Metric printed in the compression-ratio ablation cells.",
+        help="Metrics printed in the compression-ratio ablation cells.",
     )
     parser.add_argument(
         "--norm-base-press",
